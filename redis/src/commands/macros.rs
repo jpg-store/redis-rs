@@ -50,7 +50,7 @@ macro_rules! implement_commands {
             #[inline]
             fn scan<RV: FromRedisValue>(&mut self) -> RedisResult<Iter<'_, RV>> {
                 let mut c = cmd("SCAN");
-                c.cursor_arg(0);
+                c.cursor_arg("0".to_string());
                 c.iter(self)
             }
 
@@ -66,7 +66,7 @@ macro_rules! implement_commands {
             #[inline]
             fn scan_match<P: ToRedisArgs, RV: FromRedisValue>(&mut self, pattern: P) -> RedisResult<Iter<'_, RV>> {
                 let mut c = cmd("SCAN");
-                c.cursor_arg(0).arg("MATCH").arg(pattern);
+                c.cursor_arg("0".to_string()).arg("MATCH").arg(pattern);
                 c.iter(self)
             }
 
@@ -74,7 +74,7 @@ macro_rules! implement_commands {
             #[inline]
             fn hscan<K: ToRedisArgs, RV: FromRedisValue>(&mut self, key: K) -> RedisResult<Iter<'_, RV>> {
                 let mut c = cmd("HSCAN");
-                c.arg(key).cursor_arg(0);
+                c.arg(key).cursor_arg("0".to_string());
                 c.iter(self)
             }
 
@@ -84,15 +84,15 @@ macro_rules! implement_commands {
             fn hscan_match<K: ToRedisArgs, P: ToRedisArgs, RV: FromRedisValue>
                     (&mut self, key: K, pattern: P) -> RedisResult<Iter<'_, RV>> {
                 let mut c = cmd("HSCAN");
-                c.arg(key).cursor_arg(0).arg("MATCH").arg(pattern);
+                c.arg(key).cursor_arg("0".to_string()).arg("MATCH").arg(pattern);
                 c.iter(self)
             }
 
             /// Incrementally iterate set elements.
             #[inline]
-            fn sscan<K: ToRedisArgs, RV: FromRedisValue>(&mut self, key: K) -> RedisResult<Iter<'_, RV>> {
+            fn sscan<K: ToRedisArgs, RV: FromRedisValue>(&mut self, key: K,count: Option<u64>) -> RedisResult<Iter<'_, RV>> {
                 let mut c = cmd("SSCAN");
-                c.arg(key).cursor_arg(0);
+                c.arg(key).cursor_arg("0".to_string()).arg("COUNT").arg(count.unwrap_or(100));
                 c.iter(self)
             }
 
@@ -101,7 +101,7 @@ macro_rules! implement_commands {
             fn sscan_match<K: ToRedisArgs, P: ToRedisArgs, RV: FromRedisValue>
                     (&mut self, key: K, pattern: P) -> RedisResult<Iter<'_, RV>> {
                 let mut c = cmd("SSCAN");
-                c.arg(key).cursor_arg(0).arg("MATCH").arg(pattern);
+                c.arg(key).cursor_arg("0".to_string()).arg("MATCH").arg(pattern);
                 c.iter(self)
             }
 
@@ -109,7 +109,7 @@ macro_rules! implement_commands {
             #[inline]
             fn zscan<K: ToRedisArgs, RV: FromRedisValue>(&mut self, key: K) -> RedisResult<Iter<'_, RV>> {
                 let mut c = cmd("ZSCAN");
-                c.arg(key).cursor_arg(0);
+                c.arg(key).cursor_arg("0".to_string());
                 c.iter(self)
             }
 
@@ -118,7 +118,7 @@ macro_rules! implement_commands {
             fn zscan_match<K: ToRedisArgs, P: ToRedisArgs, RV: FromRedisValue>
                     (&mut self, key: K, pattern: P) -> RedisResult<Iter<'_, RV>> {
                 let mut c = cmd("ZSCAN");
-                c.arg(key).cursor_arg(0).arg("MATCH").arg(pattern);
+                c.arg(key).cursor_arg("0".to_string()).arg("MATCH").arg(pattern);
                 c.iter(self)
             }
         }
@@ -182,7 +182,7 @@ macro_rules! implement_commands {
             #[inline]
             fn scan<RV: FromRedisValue>(&mut self) -> crate::types::RedisFuture<crate::cmd::AsyncIter<'_, RV>> {
                 let mut c = cmd("SCAN");
-                c.cursor_arg(0);
+                c.cursor_arg("0".to_string());
                 Box::pin(async move { c.iter_async(self).await })
             }
 
@@ -198,7 +198,7 @@ macro_rules! implement_commands {
             #[inline]
             fn scan_match<P: ToRedisArgs, RV: FromRedisValue>(&mut self, pattern: P) -> crate::types::RedisFuture<crate::cmd::AsyncIter<'_, RV>> {
                 let mut c = cmd("SCAN");
-                c.cursor_arg(0).arg("MATCH").arg(pattern);
+                c.cursor_arg("0".to_string()).arg("MATCH").arg(pattern);
                 Box::pin(async move { c.iter_async(self).await })
             }
 
@@ -206,7 +206,7 @@ macro_rules! implement_commands {
             #[inline]
             fn hscan<K: ToRedisArgs, RV: FromRedisValue>(&mut self, key: K) -> crate::types::RedisFuture<crate::cmd::AsyncIter<'_, RV>> {
                 let mut c = cmd("HSCAN");
-                c.arg(key).cursor_arg(0);
+                c.arg(key).cursor_arg("0".to_string());
                 Box::pin(async move {c.iter_async(self).await })
             }
 
@@ -216,15 +216,15 @@ macro_rules! implement_commands {
             fn hscan_match<K: ToRedisArgs, P: ToRedisArgs, RV: FromRedisValue>
                     (&mut self, key: K, pattern: P) -> crate::types::RedisFuture<crate::cmd::AsyncIter<'_, RV>> {
                 let mut c = cmd("HSCAN");
-                c.arg(key).cursor_arg(0).arg("MATCH").arg(pattern);
+                c.arg(key).cursor_arg("0".to_string()).arg("MATCH").arg(pattern);
                 Box::pin(async move {c.iter_async(self).await })
             }
 
             /// Incrementally iterate set elements.
             #[inline]
-            fn sscan<K: ToRedisArgs, RV: FromRedisValue>(&mut self, key: K) -> crate::types::RedisFuture<crate::cmd::AsyncIter<'_, RV>> {
+            fn sscan<K: ToRedisArgs, RV: FromRedisValue>(&mut self, key: K, count: Option<u64>) -> crate::types::RedisFuture<crate::cmd::AsyncIter<'_, RV>> {
                 let mut c = cmd("SSCAN");
-                c.arg(key).cursor_arg(0);
+                c.arg(key).cursor_arg("0".to_string()).arg("COUNT").arg(count.unwrap_or(100));
                 Box::pin(async move {c.iter_async(self).await })
             }
 
@@ -233,7 +233,7 @@ macro_rules! implement_commands {
             fn sscan_match<K: ToRedisArgs, P: ToRedisArgs, RV: FromRedisValue>
                     (&mut self, key: K, pattern: P) -> crate::types::RedisFuture<crate::cmd::AsyncIter<'_, RV>> {
                 let mut c = cmd("SSCAN");
-                c.arg(key).cursor_arg(0).arg("MATCH").arg(pattern);
+                c.arg(key).cursor_arg("0".to_string()).arg("MATCH").arg(pattern);
                 Box::pin(async move {c.iter_async(self).await })
             }
 
@@ -241,7 +241,7 @@ macro_rules! implement_commands {
             #[inline]
             fn zscan<K: ToRedisArgs, RV: FromRedisValue>(&mut self, key: K) -> crate::types::RedisFuture<crate::cmd::AsyncIter<'_, RV>> {
                 let mut c = cmd("ZSCAN");
-                c.arg(key).cursor_arg(0);
+                c.arg(key).cursor_arg("0".to_string());
                 Box::pin(async move {c.iter_async(self).await })
             }
 
@@ -250,7 +250,7 @@ macro_rules! implement_commands {
             fn zscan_match<K: ToRedisArgs, P: ToRedisArgs, RV: FromRedisValue>
                     (&mut self, key: K, pattern: P) -> crate::types::RedisFuture<crate::cmd::AsyncIter<'_, RV>> {
                 let mut c = cmd("ZSCAN");
-                c.arg(key).cursor_arg(0).arg("MATCH").arg(pattern);
+                c.arg(key).cursor_arg("0".to_string()).arg("MATCH").arg(pattern);
                 Box::pin(async move {c.iter_async(self).await })
             }
         }

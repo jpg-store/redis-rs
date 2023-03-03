@@ -27,7 +27,7 @@ pub struct Cmd {
     data: Vec<u8>,
     // Arg::Simple contains the offset that marks the end of the argument
     args: Vec<Arg<usize>>,
-    cursor: Option<u64>,
+    cursor: Option<String>,
     // If it's true command's response won't be read from socket. Useful for Pub/Sub.
     no_response: bool,
 }
@@ -35,7 +35,7 @@ pub struct Cmd {
 /// Represents a redis iterator.
 pub struct Iter<'a, T: FromRedisValue> {
     batch: std::vec::IntoIter<T>,
-    cursor: u64,
+    cursor: String,
     con: &'a mut (dyn ConnectionLike + 'a),
     cmd: Cmd,
 }
@@ -53,13 +53,13 @@ impl<'a, T: FromRedisValue> Iterator for Iter<'a, T> {
             if let Some(v) = self.batch.next() {
                 return Some(v);
             };
-            if self.cursor == 0 {
+            if self.cursor == "0" {
                 return None;
             }
 
-            let pcmd = self.cmd.get_packed_command_with_cursor(self.cursor)?;
+            let pcmd = self.cmd.get_packed_command_with_cursor(self.cursor.clone())?;
             let rv = self.con.req_packed_command(&pcmd).ok()?;
-            let (cur, batch): (u64, Vec<T>) = from_owned_redis_value(rv).ok()?;
+            let (cur, batch): (String, Vec<T>) = from_owned_redis_value(rv).ok()?;
 
             self.cursor = cur;
             self.batch = batch.into_iter();
@@ -104,8 +104,8 @@ impl<'a, T: FromRedisValue + 'a> AsyncIterInner<'a, T> {
             if let Some(v) = self.batch.next() {
                 return Some(v);
             };
-            if let Some(cursor) = self.cmd.cursor {
-                if cursor == 0 {
+            if let Some(cursor) = &self.cmd.cursor {
+                if *cursor == "0" {
                     return None;
                 }
             } else {
@@ -113,7 +113,7 @@ impl<'a, T: FromRedisValue + 'a> AsyncIterInner<'a, T> {
             }
 
             let rv = self.con.req_packed_command(&self.cmd).await.ok()?;
-            let (cur, batch): (u64, Vec<T>) = from_owned_redis_value(rv).ok()?;
+            let (cur, batch): (String, Vec<T>) = from_owned_redis_value(rv).ok()?;
 
             self.cmd.cursor = Some(cur);
             self.batch = batch.into_iter();
@@ -200,14 +200,14 @@ fn bulklen(len: usize) -> usize {
     1 + countdigits(len) + 2 + len + 2
 }
 
-fn args_len<'a, I>(args: I, cursor: u64) -> usize
+fn args_len<'a, I>(args: I, cursor: String) -> usize
 where
     I: IntoIterator<Item = Arg<&'a [u8]>> + ExactSizeIterator,
 {
     let mut totlen = 1 + countdigits(args.len()) + 2;
     for item in args {
         totlen += bulklen(match item {
-            Arg::Cursor => countdigits(cursor as usize),
+            Arg::Cursor => cursor.len(),
             Arg::Simple(val) => val.len(),
         });
     }
@@ -215,10 +215,13 @@ where
 }
 
 pub(crate) fn cmd_len(cmd: &Cmd) -> usize {
-    args_len(cmd.args_iter(), cmd.cursor.unwrap_or(0))
+    args_len(
+        cmd.args_iter(),
+        cmd.cursor.clone().unwrap_or("0".to_string()),
+    )
 }
 
-fn encode_command<'a, I>(args: I, cursor: u64) -> Vec<u8>
+fn encode_command<'a, I>(args: I, cursor: String) -> Vec<u8>
 where
     I: IntoIterator<Item = Arg<&'a [u8]>> + Clone + ExactSizeIterator,
 {
@@ -227,18 +230,22 @@ where
     cmd
 }
 
-fn write_command_to_vec<'a, I>(cmd: &mut Vec<u8>, args: I, cursor: u64)
+fn write_command_to_vec<'a, I>(cmd: &mut Vec<u8>, args: I, cursor: String)
 where
     I: IntoIterator<Item = Arg<&'a [u8]>> + Clone + ExactSizeIterator,
 {
-    let totlen = args_len(args.clone(), cursor);
+    let totlen = args_len(args.clone(), cursor.clone());
 
     cmd.reserve(totlen);
 
     write_command(cmd, args, cursor).unwrap()
 }
 
-fn write_command<'a, I>(cmd: &mut (impl ?Sized + io::Write), args: I, cursor: u64) -> io::Result<()>
+fn write_command<'a, I>(
+    cmd: &mut (impl ?Sized + io::Write),
+    args: I,
+    cursor: String,
+) -> io::Result<()>
 where
     I: IntoIterator<Item = Arg<&'a [u8]>> + Clone + ExactSizeIterator,
 {
@@ -249,10 +256,9 @@ where
     cmd.write_all(s.as_bytes())?;
     cmd.write_all(b"\r\n")?;
 
-    let mut cursor_bytes = itoa::Buffer::new();
     for item in args {
         let bytes = match item {
-            Arg::Cursor => cursor_bytes.format(cursor).as_bytes(),
+            Arg::Cursor => cursor.as_bytes(),
             Arg::Simple(val) => val,
         };
 
@@ -376,7 +382,7 @@ impl Cmd {
     /// }
     /// ```
     #[inline]
-    pub fn cursor_arg(&mut self, cursor: u64) -> &mut Cmd {
+    pub fn cursor_arg(&mut self, cursor: String) -> &mut Cmd {
         assert!(!self.in_scan_mode());
         self.cursor = Some(cursor);
         self.args.push(Arg::Cursor);
@@ -392,18 +398,18 @@ impl Cmd {
     }
 
     pub(crate) fn write_packed_command(&self, cmd: &mut Vec<u8>) {
-        write_command_to_vec(cmd, self.args_iter(), self.cursor.unwrap_or(0))
+        write_command_to_vec(cmd, self.args_iter(), self.cursor.clone().unwrap_or("0".to_owned()))
     }
 
     pub(crate) fn write_packed_command_preallocated(&self, cmd: &mut Vec<u8>) {
-        write_command(cmd, self.args_iter(), self.cursor.unwrap_or(0)).unwrap()
+        write_command(cmd, self.args_iter(), self.cursor.clone().unwrap_or("0".to_owned())).unwrap()
     }
 
     /// Like `get_packed_command` but replaces the cursor with the
     /// provided value.  If the command is not in scan mode, `None`
     /// is returned.
     #[inline]
-    fn get_packed_command_with_cursor(&self, cursor: u64) -> Option<Vec<u8>> {
+    fn get_packed_command_with_cursor(&self, cursor: String) -> Option<Vec<u8>> {
         if !self.in_scan_mode() {
             None
         } else {
@@ -458,9 +464,9 @@ impl Cmd {
         let rv = con.req_command(&self)?;
 
         let (cursor, batch) = if rv.looks_like_cursor() {
-            from_owned_redis_value::<(u64, Vec<T>)>(rv)?
+            from_owned_redis_value::<(String, Vec<T>)>(rv)?
         } else {
-            (0, from_owned_redis_value(rv)?)
+            ("0".to_owned(), from_owned_redis_value(rv)?)
         };
 
         Ok(Iter {
@@ -495,11 +501,11 @@ impl Cmd {
         let rv = con.req_packed_command(&self).await?;
 
         let (cursor, batch) = if rv.looks_like_cursor() {
-            from_owned_redis_value::<(u64, Vec<T>)>(rv)?
+            from_owned_redis_value::<(String, Vec<T>)>(rv)?
         } else {
-            (0, from_owned_redis_value(rv)?)
+            ("0".to_owned(), from_owned_redis_value(rv)?)
         };
-        if cursor == 0 {
+        if cursor == "0" {
             self.cursor = None;
         } else {
             self.cursor = Some(cursor);
@@ -635,7 +641,7 @@ pub fn cmd(name: &str) -> Cmd {
 /// assert_eq!(cmd, b"*3\r\n$3\r\nSET\r\n$6\r\nmy_key\r\n$2\r\n42\r\n".to_vec());
 /// ```
 pub fn pack_command(args: &[Vec<u8>]) -> Vec<u8> {
-    encode_command(args.iter().map(|x| Arg::Simple(&x[..])), 0)
+    encode_command(args.iter().map(|x| Arg::Simple(&x[..])), "0".to_owned())
 }
 
 /// Shortcut for creating a new pipeline.

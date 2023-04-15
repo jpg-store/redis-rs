@@ -1,9 +1,6 @@
-//! Redis cluster support.
+//! This module extends the library to support Redis Cluster.
 //!
-//! This module extends the library to be able to use cluster.
-//! ClusterClient implements traits of ConnectionLike and Commands.
-//!
-//! Note that the cluster support currently does not provide pubsub
+//! Note that this module does not currently provide pubsub
 //! functionality.
 //!
 //! # Example
@@ -39,18 +36,13 @@
 //!     .query(&mut connection).unwrap();
 //! ```
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::iter::Iterator;
 use std::str::FromStr;
 use std::thread;
 use std::time::Duration;
 
-use rand::{
-    seq::{IteratorRandom, SliceRandom},
-    thread_rng, Rng,
-};
+use rand::{seq::IteratorRandom, thread_rng, Rng};
 
-use crate::cluster_client::ClusterParams;
 use crate::cluster_pipeline::UNROUTABLE_ERROR;
 use crate::cluster_routing::{Routable, RoutingInfo, Slot, SLOT_SIZE};
 use crate::cmd::{cmd, Cmd};
@@ -59,14 +51,79 @@ use crate::connection::{
 };
 use crate::parser::parse_redis_value;
 use crate::types::{ErrorKind, HashMap, HashSet, RedisError, RedisResult, Value};
+use crate::IntoConnectionInfo;
+use crate::{
+    cluster_client::ClusterParams,
+    cluster_routing::{Route, SlotAddr, SlotAddrs, SlotMap},
+};
 
 pub use crate::cluster_client::{ClusterClient, ClusterClientBuilder};
 pub use crate::cluster_pipeline::{cluster_pipe, ClusterPipeline};
 
-/// This is a connection of Redis cluster.
-pub struct ClusterConnection {
+/// Implements the process of connecting to a Redis server
+/// and obtaining and configuring a connection handle.
+pub trait Connect: Sized {
+    /// Connect to a node, returning handle for command execution.
+    fn connect<T>(info: T, timeout: Option<Duration>) -> RedisResult<Self>
+    where
+        T: IntoConnectionInfo;
+
+    /// Sends an already encoded (packed) command into the TCP socket and
+    /// does not read a response.  This is useful for commands like
+    /// `MONITOR` which yield multiple items.  This needs to be used with
+    /// care because it changes the state of the connection.
+    fn send_packed_command(&mut self, cmd: &[u8]) -> RedisResult<()>;
+
+    /// Sets the write timeout for the connection.
+    ///
+    /// If the provided value is `None`, then `send_packed_command` call will
+    /// block indefinitely. It is an error to pass the zero `Duration` to this
+    /// method.
+    fn set_write_timeout(&self, dur: Option<Duration>) -> RedisResult<()>;
+
+    /// Sets the read timeout for the connection.
+    ///
+    /// If the provided value is `None`, then `recv_response` call will
+    /// block indefinitely. It is an error to pass the zero `Duration` to this
+    /// method.
+    fn set_read_timeout(&self, dur: Option<Duration>) -> RedisResult<()>;
+
+    /// Fetches a single response from the connection.  This is useful
+    /// if used in combination with `send_packed_command`.
+    fn recv_response(&mut self) -> RedisResult<Value>;
+}
+
+impl Connect for Connection {
+    fn connect<T>(info: T, timeout: Option<Duration>) -> RedisResult<Self>
+    where
+        T: IntoConnectionInfo,
+    {
+        connect(&info.into_connection_info()?, timeout)
+    }
+
+    fn send_packed_command(&mut self, cmd: &[u8]) -> RedisResult<()> {
+        Self::send_packed_command(self, cmd)
+    }
+
+    fn set_write_timeout(&self, dur: Option<Duration>) -> RedisResult<()> {
+        Self::set_write_timeout(self, dur)
+    }
+
+    fn set_read_timeout(&self, dur: Option<Duration>) -> RedisResult<()> {
+        Self::set_read_timeout(self, dur)
+    }
+
+    fn recv_response(&mut self) -> RedisResult<Value> {
+        Self::recv_response(self)
+    }
+}
+
+/// This represents a Redis Cluster connection. It stores the
+/// underlying connections maintained for each node in the cluster, as well
+/// as common parameters for connecting to nodes and executing commands.
+pub struct ClusterConnection<C = Connection> {
     initial_nodes: Vec<ConnectionInfo>,
-    connections: RefCell<HashMap<String, Connection>>,
+    connections: RefCell<HashMap<String, C>>,
     slots: RefCell<SlotMap>,
     auto_reconnect: RefCell<bool>,
     read_from_replicas: bool,
@@ -75,14 +132,18 @@ pub struct ClusterConnection {
     read_timeout: RefCell<Option<Duration>>,
     write_timeout: RefCell<Option<Duration>>,
     tls: Option<TlsMode>,
+    retries: u32,
 }
 
-impl ClusterConnection {
+impl<C> ClusterConnection<C>
+where
+    C: ConnectionLike + Connect,
+{
     pub(crate) fn new(
         cluster_params: ClusterParams,
         initial_nodes: Vec<ConnectionInfo>,
-    ) -> RedisResult<ClusterConnection> {
-        let connection = ClusterConnection {
+    ) -> RedisResult<Self> {
+        let connection = Self {
             connections: RefCell::new(HashMap::new()),
             slots: RefCell::new(SlotMap::new()),
             auto_reconnect: RefCell::new(true),
@@ -93,6 +154,7 @@ impl ClusterConnection {
             write_timeout: RefCell::new(None),
             tls: cluster_params.tls,
             initial_nodes: initial_nodes.to_vec(),
+            retries: cluster_params.retries,
         };
         connection.create_initial_connections()?;
 
@@ -198,19 +260,7 @@ impl ClusterConnection {
     // Query a node to discover slot-> master mappings.
     fn refresh_slots(&self) -> RedisResult<()> {
         let mut slots = self.slots.borrow_mut();
-        *slots = self.create_new_slots(|slot_data| {
-            let replica = if !self.read_from_replicas || slot_data.replicas().is_empty() {
-                slot_data.master().to_string()
-            } else {
-                slot_data
-                    .replicas()
-                    .choose(&mut thread_rng())
-                    .unwrap()
-                    .to_string()
-            };
-
-            [slot_data.master().to_string(), replica]
-        })?;
+        *slots = self.create_new_slots()?;
 
         let mut nodes = slots.values().flatten().collect::<Vec<_>>();
         nodes.sort_unstable();
@@ -243,10 +293,7 @@ impl ClusterConnection {
         Ok(())
     }
 
-    fn create_new_slots<F>(&self, mut get_addr: F) -> RedisResult<SlotMap>
-    where
-        F: FnMut(&Slot) -> [String; 2],
-    {
+    fn create_new_slots(&self) -> RedisResult<SlotMap> {
         let mut connections = self.connections.borrow_mut();
         let mut new_slots = None;
         let mut rng = thread_rng();
@@ -284,7 +331,12 @@ impl ClusterConnection {
                 new_slots = Some(
                     slots_data
                         .iter()
-                        .map(|slot_data| (slot_data.end(), get_addr(slot_data)))
+                        .map(|slot| {
+                            (
+                                slot.end(),
+                                SlotAddrs::from_slot(slot, self.read_from_replicas),
+                            )
+                        })
                         .collect(),
                 );
                 break;
@@ -301,7 +353,7 @@ impl ClusterConnection {
         }
     }
 
-    fn connect(&self, node: &str) -> RedisResult<Connection> {
+    fn connect(&self, node: &str) -> RedisResult<C> {
         let params = ClusterParams {
             password: self.password.clone(),
             username: self.username.clone(),
@@ -310,7 +362,7 @@ impl ClusterConnection {
         };
         let info = get_connection_info(node, params)?;
 
-        let mut conn = connect(&info, None)?;
+        let mut conn = C::connect(info, None)?;
         if self.read_from_replicas {
             // If READONLY is sent to primary nodes, it will have no effect
             cmd("READONLY").query(&mut conn)?;
@@ -320,15 +372,15 @@ impl ClusterConnection {
 
     fn get_connection<'a>(
         &self,
-        connections: &'a mut HashMap<String, Connection>,
-        route: (u16, usize),
-    ) -> RedisResult<(String, &'a mut Connection)> {
-        let (slot, idx) = route;
+        connections: &'a mut HashMap<String, C>,
+        route: &Route,
+    ) -> RedisResult<(String, &'a mut C)> {
         let slots = self.slots.borrow();
-        if let Some((_, addr)) = slots.range(&slot..).next() {
+        if let Some((_, slot_addrs)) = slots.range(route.slot()..).next() {
+            let addr = &slot_addrs.slot_addr(route.slot_addr());
             Ok((
-                addr[idx].clone(),
-                self.get_connection_by_addr(connections, &addr[idx])?,
+                addr.to_string(),
+                self.get_connection_by_addr(connections, addr)?,
             ))
         } else {
             // try a random node next.  This is safe if slots are involved
@@ -339,9 +391,9 @@ impl ClusterConnection {
 
     fn get_connection_by_addr<'a>(
         &self,
-        connections: &'a mut HashMap<String, Connection>,
+        connections: &'a mut HashMap<String, C>,
         addr: &str,
-    ) -> RedisResult<&'a mut Connection> {
+    ) -> RedisResult<&'a mut C> {
         if connections.contains_key(addr) {
             Ok(connections.get_mut(addr).unwrap())
         } else {
@@ -355,21 +407,24 @@ impl ClusterConnection {
     fn get_addr_for_cmd(&self, cmd: &Cmd) -> RedisResult<String> {
         let slots = self.slots.borrow();
 
-        let addr_for_slot = |slot: u16, idx: usize| -> RedisResult<String> {
-            let (_, addr) = slots
+        let addr_for_slot = |slot: u16, slot_addr: SlotAddr| -> RedisResult<String> {
+            let (_, slot_addrs) = slots
                 .range(&slot..)
                 .next()
                 .ok_or((ErrorKind::ClusterDown, "Missing slot coverage"))?;
-            Ok(addr[idx].clone())
+            Ok(slot_addrs.slot_addr(&slot_addr).to_string())
         };
 
         match RoutingInfo::for_routable(cmd) {
             Some(RoutingInfo::Random) => {
                 let mut rng = thread_rng();
-                Ok(addr_for_slot(rng.gen_range(0..SLOT_SIZE), 0)?)
+                Ok(addr_for_slot(
+                    rng.gen_range(0..SLOT_SIZE),
+                    SlotAddr::Master,
+                )?)
             }
-            Some(RoutingInfo::MasterSlot(slot)) => Ok(addr_for_slot(slot, 0)?),
-            Some(RoutingInfo::ReplicaSlot(slot)) => Ok(addr_for_slot(slot, 1)?),
+            Some(RoutingInfo::MasterSlot(slot)) => Ok(addr_for_slot(slot, SlotAddr::Master)?),
+            Some(RoutingInfo::ReplicaSlot(slot)) => Ok(addr_for_slot(slot, SlotAddr::Replica)?),
             _ => fail!(UNROUTABLE_ERROR),
         }
     }
@@ -396,7 +451,7 @@ impl ClusterConnection {
     fn execute_on_all_nodes<T, F>(&self, mut func: F) -> RedisResult<T>
     where
         T: MergeResults,
-        F: FnMut(&mut Connection) -> RedisResult<T>,
+        F: FnMut(&mut C) -> RedisResult<T>,
     {
         let mut connections = self.connections.borrow_mut();
         let mut results = HashMap::new();
@@ -414,19 +469,19 @@ impl ClusterConnection {
     where
         R: ?Sized + Routable,
         T: MergeResults + std::fmt::Debug,
-        F: FnMut(&mut Connection) -> RedisResult<T>,
+        F: FnMut(&mut C) -> RedisResult<T>,
     {
         let route = match RoutingInfo::for_routable(cmd) {
             Some(RoutingInfo::Random) => None,
-            Some(RoutingInfo::MasterSlot(slot)) => Some((slot, 0)),
-            Some(RoutingInfo::ReplicaSlot(slot)) => Some((slot, 1)),
+            Some(RoutingInfo::MasterSlot(slot)) => Some(Route::new(slot, SlotAddr::Master)),
+            Some(RoutingInfo::ReplicaSlot(slot)) => Some(Route::new(slot, SlotAddr::Replica)),
             Some(RoutingInfo::AllNodes) | Some(RoutingInfo::AllMasters) => {
                 return self.execute_on_all_nodes(func);
             }
             None => fail!(UNROUTABLE_ERROR),
         };
 
-        let mut retries = 16;
+        let mut retries = self.retries;
         let mut excludes = HashSet::new();
         let mut redirected = None::<String>;
         let mut is_asking = false;
@@ -447,7 +502,7 @@ impl ClusterConnection {
                 } else if !excludes.is_empty() || route.is_none() {
                     get_random_connection(&mut connections, Some(&excludes))
                 } else {
-                    self.get_connection(&mut connections, route.unwrap())?
+                    self.get_connection(&mut connections, route.as_ref().unwrap())?
                 };
                 (addr, func(conn))
             };
@@ -455,10 +510,10 @@ impl ClusterConnection {
             match rv {
                 Ok(rv) => return Ok(rv),
                 Err(err) => {
-                    retries -= 1;
                     if retries == 0 {
                         return Err(err);
                     }
+                    retries -= 1;
 
                     if err.is_cluster_error() {
                         let kind = err.kind();
@@ -569,7 +624,7 @@ impl ClusterConnection {
     }
 }
 
-impl ConnectionLike for ClusterConnection {
+impl<C: Connect + ConnectionLike> ConnectionLike for ClusterConnection<C> {
     fn supports_pipelining(&self) -> bool {
         false
     }
@@ -645,8 +700,6 @@ impl MergeResults for Vec<Value> {
     }
 }
 
-type SlotMap = BTreeMap<u16, [String; 2]>;
-
 #[derive(Debug)]
 struct NodeCmd {
     // The original command indexes
@@ -675,10 +728,10 @@ pub enum TlsMode {
     Insecure,
 }
 
-fn get_random_connection<'a>(
-    connections: &'a mut HashMap<String, Connection>,
+fn get_random_connection<'a, C: ConnectionLike + Connect + Sized>(
+    connections: &'a mut HashMap<String, C>,
     excludes: Option<&'a HashSet<String>>,
-) -> (String, &'a mut Connection) {
+) -> (String, &'a mut C) {
     let mut rng = thread_rng();
     let addr = match excludes {
         Some(excludes) if excludes.len() < connections.len() => connections
@@ -767,13 +820,15 @@ pub(crate) fn get_connection_info(
     node: &str,
     cluster_params: ClusterParams,
 ) -> RedisResult<ConnectionInfo> {
-    let mut split = node.split(':');
     let invalid_error = || (ErrorKind::InvalidClientConfig, "Invalid node string");
 
-    let host = split.next().ok_or_else(invalid_error)?;
-    let port = split
-        .next()
-        .and_then(|string| u16::from_str(string).ok())
+    let (host, port) = node
+        .rsplit_once(':')
+        .and_then(|(host, port)| {
+            Some(host.trim_start_matches('[').trim_end_matches(']'))
+                .filter(|h| !h.is_empty())
+                .zip(u16::from_str(port).ok())
+        })
         .ok_or_else(invalid_error)?;
 
     Ok(ConnectionInfo {
@@ -806,4 +861,48 @@ pub(crate) fn slot_cmd() -> Cmd {
     let mut cmd = Cmd::new();
     cmd.arg("CLUSTER").arg("SLOTS");
     cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_cluster_node_host_port() {
+        let cases = vec![
+            (
+                "127.0.0.1:6379",
+                ConnectionAddr::Tcp("127.0.0.1".to_string(), 6379u16),
+            ),
+            (
+                "localhost.localdomain:6379",
+                ConnectionAddr::Tcp("localhost.localdomain".to_string(), 6379u16),
+            ),
+            (
+                "dead::cafe:beef:30001",
+                ConnectionAddr::Tcp("dead::cafe:beef".to_string(), 30001u16),
+            ),
+            (
+                "[fe80::cafe:beef%en1]:30001",
+                ConnectionAddr::Tcp("fe80::cafe:beef%en1".to_string(), 30001u16),
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let res = get_connection_info(input, ClusterParams::default());
+            assert_eq!(res.unwrap().addr, expected);
+        }
+
+        let cases = vec![":0", "[]:6379"];
+        for input in cases {
+            let res = get_connection_info(input, ClusterParams::default());
+            assert_eq!(
+                res.err(),
+                Some(RedisError::from((
+                    ErrorKind::InvalidClientConfig,
+                    "Invalid node string",
+                ))),
+            );
+        }
+    }
 }

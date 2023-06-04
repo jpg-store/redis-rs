@@ -377,9 +377,15 @@ impl error::Error for RedisError {
 impl fmt::Display for RedisError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         match self.repr {
-            ErrorRepr::WithDescription(_, desc) => desc.fmt(f),
-            ErrorRepr::WithDescriptionAndDetail(_, desc, ref detail) => {
+            ErrorRepr::WithDescription(kind, desc) => {
                 desc.fmt(f)?;
+                f.write_str("- ")?;
+                fmt::Debug::fmt(&kind, f)
+            }
+            ErrorRepr::WithDescriptionAndDetail(kind, desc, ref detail) => {
+                desc.fmt(f)?;
+                f.write_str(" - ")?;
+                fmt::Debug::fmt(&kind, f)?;
                 f.write_str(": ")?;
                 detail.fmt(f)
             }
@@ -524,7 +530,9 @@ impl RedisError {
         match self.repr {
             ErrorRepr::IoError(ref err) => matches!(
                 err.kind(),
-                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::UnexpectedEof
             ),
             _ => false,
         }
@@ -580,6 +588,35 @@ impl RedisError {
             )),
         };
         Self { repr }
+    }
+
+    // TODO: In addition to/instead of returning a bool here, consider a method
+    // that returns an enum with more detail about _how_ to retry errors, e.g.,
+    // `RetryImmediately`, `WaitAndRetry`, etc.
+    #[cfg(feature = "cluster")] // Used to avoid "unused method" warning
+    pub(crate) fn is_retryable(&self) -> bool {
+        match self.kind() {
+            ErrorKind::BusyLoadingError => true,
+            ErrorKind::Moved => true,
+            ErrorKind::Ask => true,
+            ErrorKind::TryAgain => true,
+            ErrorKind::MasterDown => true,
+            ErrorKind::IoError => true,
+            ErrorKind::ReadOnly => true,
+            ErrorKind::ClusterDown => true,
+
+            ErrorKind::ExtensionError => false,
+            ErrorKind::ExecAbortError => false,
+            ErrorKind::ResponseError => false,
+            ErrorKind::AuthenticationFailed => false,
+            ErrorKind::TypeError => false,
+            ErrorKind::NoScriptError => false,
+            ErrorKind::InvalidClientConfig => false,
+            ErrorKind::CrossSlot => false,
+            ErrorKind::ClientError => false,
+            #[cfg(feature = "json")]
+            ErrorKind::Serialize => false,
+        }
     }
 }
 

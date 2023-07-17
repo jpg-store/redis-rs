@@ -41,6 +41,8 @@ mod cluster;
 #[cfg(any(feature = "cluster", feature = "cluster-async"))]
 mod mock_cluster;
 
+mod util;
+
 #[cfg(any(feature = "cluster", feature = "cluster-async"))]
 pub use self::cluster::*;
 
@@ -59,7 +61,7 @@ pub enum Module {
 
 pub struct RedisServer {
     pub process: process::Child,
-    tempdir: Option<tempfile::TempDir>,
+    tempdir: tempfile::TempDir,
     addr: redis::ConnectionAddr,
 }
 
@@ -73,9 +75,10 @@ impl ServerType {
             Some("tcp") => ServerType::Tcp { tls: false },
             Some("tcp+tls") => ServerType::Tcp { tls: true },
             Some("unix") => ServerType::Unix,
-            val => {
+            Some(val) => {
                 panic!("Unknown server type {val:?}");
             }
+            None => ServerType::Tcp { tls: false },
         }
     }
 }
@@ -157,6 +160,7 @@ impl RedisServer {
             .prefix("redis")
             .tempdir()
             .expect("failed to create tempdir");
+        redis_cmd.arg("--logfile").arg(Self::log_file(&tempdir));
         match addr {
             redis::ConnectionAddr::Tcp(ref bind, server_port) => {
                 redis_cmd
@@ -167,7 +171,7 @@ impl RedisServer {
 
                 RedisServer {
                     process: spawner(&mut redis_cmd),
-                    tempdir: None,
+                    tempdir,
                     addr,
                 }
             }
@@ -199,7 +203,7 @@ impl RedisServer {
 
                 RedisServer {
                     process: spawner(&mut redis_cmd),
-                    tempdir: Some(tempdir),
+                    tempdir,
                     addr,
                 }
             }
@@ -211,7 +215,7 @@ impl RedisServer {
                     .arg(path);
                 RedisServer {
                     process: spawner(&mut redis_cmd),
-                    tempdir: Some(tempdir),
+                    tempdir,
                     addr,
                 }
             }
@@ -235,6 +239,10 @@ impl RedisServer {
         if let redis::ConnectionAddr::Unix(ref path) = *self.client_addr() {
             fs::remove_file(path).ok();
         }
+    }
+
+    pub fn log_file(tempdir: &TempDir) -> PathBuf {
+        tempdir.path().join("redis.log")
     }
 }
 

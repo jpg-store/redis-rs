@@ -15,6 +15,9 @@ readme = "../README.md"
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
+[lib]
+bench = false
+
 [dependencies]
 # These two are generally really common simple dependencies so it does not seem
 # much of a point to optimize these, but these could in theory be removed for
@@ -39,6 +42,7 @@ futures-util = { version = "0.3.15", default-features = false, optional = true }
 pin-project-lite = { version = "0.2", optional = true }
 tokio-util = { version = "0.7", optional = true }
 tokio = { version = "1", features = ["rt", "net", "time"], optional = true }
+socket2 = { version = "0.4", default-features = false, optional = true }
 
 # Only needed for the connection manager
 arc-swap = { version = "1.1.0", optional = true }
@@ -77,7 +81,7 @@ ahash = { version = "0.7.6", optional = true }
 log = { version = "0.4", optional = true }
 
 [features]
-default = ["acl", "streams", "geospatial", "script"]
+default = ["acl", "streams", "geospatial", "script", "keep-alive"]
 acl = []
 aio = ["bytes", "pin-project-lite", "futures-util", "futures-util/alloc", "futures-util/sink", "tokio/io-util", "tokio-util", "tokio-util/codec", "tokio/sync", "combine/tokio", "async-trait"]
 geospatial = []
@@ -97,6 +101,7 @@ tokio-rustls-comp = ["tokio-comp", "tls-rustls", "tokio-rustls"]
 connection-manager = ["arc-swap", "futures", "aio", "tokio-retry"]
 streams = []
 cluster-async = ["cluster", "futures", "futures-util", "log"]
+keep-alive = ["socket2"]
 
 # Deprecated features
 tls = ["tls-native-tls"] # use "tls-native-tls" instead
@@ -148,6 +153,11 @@ required-features = ["tokio-comp"]
 name = "bench_cluster"
 harness = false
 required-features = ["cluster"]
+
+[[bench]]
+name = "bench_cluster_async"
+harness = false
+required-features = ["cluster-async", "tokio-comp"]
 
 [[example]]
 name = "async-multiplexed"

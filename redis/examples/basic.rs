@@ -57,7 +57,7 @@ fn do_show_scanning(con: &mut redis::Connection) -> redis::RedisResult<()> {
     // since rust currently does not track temporaries for us, we need to
     // store it in a local variable.
     let mut cmd = redis::cmd("SSCAN");
-    cmd.arg("my_set").cursor_arg(0);
+    cmd.arg("my_set").cursor_arg("0".to_owned());
 
     // as a simple exercise we just sum up the iterator.  Since the fold
     // method carries an initial value we do not need to define the

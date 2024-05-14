@@ -374,7 +374,7 @@ mod basic {
 
         let iter = redis::cmd("SSCAN")
             .arg("foo")
-            .cursor_arg(0)
+            .cursor_arg("0".to_owned())
             .clone()
             .iter(&mut con)
             .unwrap();

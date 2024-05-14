@@ -439,7 +439,7 @@ mod basic_async {
 
                         let mut iter = redis::cmd("SSCAN")
                             .arg("foo")
-                            .cursor_arg(0)
+                            .cursor_arg("0".to_owned())
                             .clone()
                             .iter_async(&mut con)
                             .await

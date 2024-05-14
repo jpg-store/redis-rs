@@ -1,9 +1,8 @@
 //! Adds async IO support to redis.
 use crate::cmd::{cmd, Cmd};
+use crate::connection::get_resp3_hello_command_error;
 use crate::connection::RedisConnectionInfo;
-use crate::types::{ErrorKind, RedisFuture, RedisResult, Value};
-#[cfg(all(not(feature = "tokio-comp"), feature = "async-std-comp"))]
-use ::async_std::net::ToSocketAddrs;
+use crate::types::{ErrorKind, ProtocolVersion, RedisFuture, RedisResult, Value};
 use ::tokio::io::{AsyncRead, AsyncWrite};
 use async_trait::async_trait;
 use futures_util::Future;
@@ -16,6 +15,12 @@ use std::pin::Pin;
 #[cfg(feature = "async-std-comp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "async-std-comp")))]
 pub mod async_std;
+
+#[cfg(feature = "tls-rustls")]
+use crate::tls::TlsConnParams;
+
+#[cfg(all(feature = "tls-native-tls", not(feature = "tls-rustls")))]
+use crate::connection::TlsConnParams;
 
 /// Enables the tokio compatibility
 #[cfg(feature = "tokio-comp")]
@@ -34,6 +39,7 @@ pub(crate) trait RedisRuntime: AsyncStream + Send + Sync + Sized + 'static {
         hostname: &str,
         socket_addr: SocketAddr,
         insecure: bool,
+        tls_params: &Option<TlsConnParams>,
     ) -> RedisResult<Self>;
 
     /// Performs a UNIX connection
@@ -60,6 +66,11 @@ pub trait ConnectionLike {
     /// Sends multiple already encoded (packed) command into the TCP socket
     /// and reads `count` responses from it.  This is used to implement
     /// pipelining.
+    /// Important - this function is meant for internal usage, since it's
+    /// easy to pass incorrect `offset` & `count` parameters, which might
+    /// cause the connection to enter an erroneous state. Users shouldn't
+    /// call it, instead using the Pipeline::query_async function.
+    #[doc(hidden)]
     fn req_packed_commands<'a>(
         &'a mut self,
         cmd: &'a crate::Pipeline,
@@ -74,11 +85,18 @@ pub trait ConnectionLike {
     fn get_db(&self) -> i64;
 }
 
-async fn authenticate<C>(connection_info: &RedisConnectionInfo, con: &mut C) -> RedisResult<()>
+// Initial setup for every connection.
+async fn setup_connection<C>(connection_info: &RedisConnectionInfo, con: &mut C) -> RedisResult<()>
 where
     C: ConnectionLike,
 {
-    if let Some(password) = &connection_info.password {
+    if connection_info.protocol != ProtocolVersion::RESP2 {
+        let hello_cmd = resp3_hello(connection_info);
+        let val: RedisResult<Value> = hello_cmd.query_async(con).await;
+        if let Err(err) = val {
+            return Err(get_resp3_hello_command_error(err));
+        }
+    } else if let Some(password) = &connection_info.password {
         let mut command = cmd("AUTH");
         if let Some(username) = &connection_info.username {
             command.arg(username);
@@ -128,6 +146,13 @@ where
         }
     }
 
+    // result is ignored, as per the command's instructions.
+    // https://redis.io/commands/client-setinfo/
+    #[cfg(not(feature = "disable-client-setinfo"))]
+    let _: RedisResult<()> = crate::connection::client_set_info_pipeline()
+        .query_async(con)
+        .await;
+
     Ok(())
 }
 
@@ -138,6 +163,8 @@ pub use multiplexed_connection::*;
 #[cfg(feature = "connection-manager")]
 mod connection_manager;
 #[cfg(feature = "connection-manager")]
+#[cfg_attr(docsrs, doc(cfg(feature = "connection-manager")))]
 pub use connection_manager::*;
 mod runtime;
+use crate::commands::resp3_hello;
 pub(super) use runtime::*;

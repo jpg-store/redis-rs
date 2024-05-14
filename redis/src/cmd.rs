@@ -10,7 +10,7 @@ use std::{fmt, io};
 
 use crate::connection::ConnectionLike;
 use crate::pipeline::Pipeline;
-use crate::types::{from_redis_value, FromRedisValue, RedisResult, RedisWrite, ToRedisArgs};
+use crate::types::{from_owned_redis_value, FromRedisValue, RedisResult, RedisWrite, ToRedisArgs};
 
 /// An argument to a redis command
 #[derive(Clone)]
@@ -28,6 +28,8 @@ pub struct Cmd {
     // Arg::Simple contains the offset that marks the end of the argument
     args: Vec<Arg<usize>>,
     cursor: Option<String>,
+    // If it's true command's response won't be read from socket. Useful for Pub/Sub.
+    no_response: bool,
 }
 
 /// Represents a redis iterator.
@@ -55,13 +57,10 @@ impl<'a, T: FromRedisValue> Iterator for Iter<'a, T> {
                 return None;
             }
 
-            let pcmd = unwrap_or!(
-                self.cmd.get_packed_command_with_cursor(self.cursor.clone()),
-                return None
-            );
-            let rv = unwrap_or!(self.con.req_packed_command(&pcmd).ok(), return None);
+            let pcmd = self.cmd.get_packed_command_with_cursor(self.cursor.clone())?;
+            let rv = self.con.req_packed_command(&pcmd).ok()?;
             let (cur, batch): (String, Vec<T>) =
-                unwrap_or!(from_redis_value(&rv).ok(), return None);
+                from_owned_redis_value(rv).ok()?;
 
             self.cursor = cur;
             self.batch = batch.into_iter();
@@ -114,12 +113,9 @@ impl<'a, T: FromRedisValue + 'a> AsyncIterInner<'a, T> {
                 return None;
             }
 
-            let rv = unwrap_or!(
-                self.con.req_packed_command(&self.cmd).await.ok(),
-                return None
-            );
+            let rv = self.con.req_packed_command(&self.cmd).await.ok()?;
             let (cur, batch): (String, Vec<T>) =
-                unwrap_or!(from_redis_value(&rv).ok(), return None);
+                from_owned_redis_value(rv).ok()?;
 
             self.cmd.cursor = Some(cur.clone().to_string());
             self.batch = batch.into_iter();
@@ -333,6 +329,7 @@ impl Cmd {
             data: vec![],
             args: vec![],
             cursor: None,
+            no_response: false,
         }
     }
 
@@ -342,7 +339,15 @@ impl Cmd {
             data: Vec::with_capacity(size_of_data),
             args: Vec::with_capacity(arg_count),
             cursor: None,
+            no_response: false,
         }
+    }
+
+    /// Get the capacities for the internal buffers.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn capacity(&self) -> (usize, usize) {
+        (self.args.capacity(), self.data.capacity())
     }
 
     /// Appends an argument to the command.  The argument passed must
@@ -436,7 +441,7 @@ impl Cmd {
     #[inline]
     pub fn query<T: FromRedisValue>(&self, con: &mut dyn ConnectionLike) -> RedisResult<T> {
         match con.req_command(self) {
-            Ok(val) => from_redis_value(&val),
+            Ok(val) => from_owned_redis_value(val),
             Err(e) => Err(e),
         }
     }
@@ -449,7 +454,7 @@ impl Cmd {
         C: crate::aio::ConnectionLike,
     {
         let val = con.req_packed_command(self).await?;
-        from_redis_value(&val)
+        from_owned_redis_value(val)
     }
 
     /// Similar to `query()` but returns an iterator over the items of the
@@ -471,9 +476,9 @@ impl Cmd {
         let rv = con.req_command(&self)?;
 
         let (cursor, batch) = if rv.looks_like_cursor() {
-            from_redis_value::<(String, Vec<T>)>(&rv)?
+            from_owned_redis_value::<(String, Vec<T>)>(rv)?
         } else {
-            ("0".to_string(), from_redis_value(&rv)?)
+            ("0".to_string(), from_owned_redis_value(rv)?)
         };
 
         Ok(Iter {
@@ -508,9 +513,9 @@ impl Cmd {
         let rv = con.req_packed_command(&self).await?;
 
         let (cursor, batch) = if rv.looks_like_cursor() {
-            from_redis_value::<(String, Vec<T>)>(&rv)?
+            from_owned_redis_value::<(String, Vec<T>)>(rv)?
         } else {
-            ("0".to_string(), from_redis_value(&rv)?)
+            ("0".to_string(), from_owned_redis_value(rv)?)
         };
         if cursor.eq(&"0".to_string()) {
             self.cursor = None;
@@ -545,7 +550,7 @@ impl Cmd {
     }
 
     /// Returns an iterator over the arguments in this command (including the command name itself)
-    pub fn args_iter(&self) -> impl Iterator<Item = Arg<&[u8]>> + Clone + ExactSizeIterator {
+    pub fn args_iter(&self) -> impl Clone + ExactSizeIterator<Item = Arg<&[u8]>> {
         let mut prev = 0;
         self.args.iter().map(move |arg| match *arg {
             Arg::Simple(i) => {
@@ -581,6 +586,19 @@ impl Cmd {
             return None;
         }
         Some(&self.data[start..end])
+    }
+
+    /// Client won't read and wait for results. Currently only used for Pub/Sub commands in RESP3.
+    #[inline]
+    pub fn set_no_response(&mut self, nr: bool) -> &mut Cmd {
+        self.no_response = nr;
+        self
+    }
+
+    /// Check whether command's result will be waited for.
+    #[inline]
+    pub fn is_no_response(&self) -> bool {
+        self.no_response
     }
 }
 

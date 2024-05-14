@@ -19,12 +19,18 @@ use native_tls::TlsConnector;
 #[cfg(feature = "tls-rustls")]
 use crate::connection::create_rustls_config;
 #[cfg(feature = "tls-rustls")]
-use std::{convert::TryInto, sync::Arc};
+use std::sync::Arc;
 #[cfg(feature = "tls-rustls")]
 use tokio_rustls::{client::TlsStream, TlsConnector};
 
 #[cfg(all(feature = "tokio-native-tls-comp", not(feature = "tokio-rustls-comp")))]
 use tokio_native_tls::TlsStream;
+
+#[cfg(feature = "tokio-rustls-comp")]
+use crate::tls::TlsConnParams;
+
+#[cfg(all(feature = "tokio-native-tls-comp", not(feature = "tls-rustls")))]
+use crate::connection::TlsConnParams;
 
 #[cfg(unix)]
 use super::Path;
@@ -32,6 +38,8 @@ use super::Path;
 #[inline(always)]
 async fn connect_tcp(addr: &SocketAddr) -> io::Result<TcpStreamTokio> {
     let socket = TcpStreamTokio::connect(addr).await?;
+    #[cfg(feature = "tcp_nodelay")]
+    socket.set_nodelay(true)?;
     #[cfg(feature = "keep-alive")]
     {
         //For now rely on system defaults
@@ -123,6 +131,7 @@ impl RedisRuntime for Tokio {
         hostname: &str,
         socket_addr: SocketAddr,
         insecure: bool,
+        _: &Option<TlsConnParams>,
     ) -> RedisResult<Self> {
         let tls_connector: tokio_native_tls::TlsConnector = if insecure {
             TlsConnector::builder()
@@ -145,12 +154,16 @@ impl RedisRuntime for Tokio {
         hostname: &str,
         socket_addr: SocketAddr,
         insecure: bool,
+        tls_params: &Option<TlsConnParams>,
     ) -> RedisResult<Self> {
-        let config = create_rustls_config(insecure)?;
+        let config = create_rustls_config(insecure, tls_params.clone())?;
         let tls_connector = TlsConnector::from(Arc::new(config));
 
         Ok(tls_connector
-            .connect(hostname.try_into()?, connect_tcp(&socket_addr).await?)
+            .connect(
+                rustls_pki_types::ServerName::try_from(hostname)?.to_owned(),
+                connect_tcp(&socket_addr).await?,
+            )
             .await
             .map(|con| Tokio::TcpTls(Box::new(con)))?)
     }

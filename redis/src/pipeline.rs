@@ -3,7 +3,7 @@
 use crate::cmd::{cmd, cmd_len, Cmd};
 use crate::connection::ConnectionLike;
 use crate::types::{
-    from_redis_value, ErrorKind, FromRedisValue, HashSet, RedisResult, ToRedisArgs, Value,
+    from_owned_redis_value, ErrorKind, FromRedisValue, HashSet, RedisResult, ToRedisArgs, Value,
 };
 
 /// Represents a redis command pipeline.
@@ -96,7 +96,7 @@ impl Pipeline {
         )?;
         match resp.pop() {
             Some(Value::Nil) => Ok(Value::Nil),
-            Some(Value::Bulk(items)) => Ok(self.make_pipeline_results(items)),
+            Some(Value::Array(items)) => Ok(self.make_pipeline_results(items)),
             _ => fail!((
                 ErrorKind::ResponseError,
                 "Invalid response when parsing multi response"
@@ -129,15 +129,13 @@ impl Pipeline {
                 "This connection does not support pipelining."
             ));
         }
-        from_redis_value(
-            &(if self.commands.is_empty() {
-                Value::Bulk(vec![])
-            } else if self.transaction_mode {
-                self.execute_transaction(con)?
-            } else {
-                self.execute_pipelined(con)?
-            }),
-        )
+        from_owned_redis_value(if self.commands.is_empty() {
+            Value::Array(vec![])
+        } else if self.transaction_mode {
+            self.execute_transaction(con)?
+        } else {
+            self.execute_pipelined(con)?
+        })
     }
 
     #[cfg(feature = "aio")]
@@ -161,7 +159,7 @@ impl Pipeline {
             .await?;
         match resp.pop() {
             Some(Value::Nil) => Ok(Value::Nil),
-            Some(Value::Bulk(items)) => Ok(self.make_pipeline_results(items)),
+            Some(Value::Array(items)) => Ok(self.make_pipeline_results(items)),
             _ => Err((
                 ErrorKind::ResponseError,
                 "Invalid response when parsing multi response",
@@ -178,13 +176,13 @@ impl Pipeline {
         C: crate::aio::ConnectionLike,
     {
         let v = if self.commands.is_empty() {
-            return from_redis_value(&Value::Bulk(vec![]));
+            return from_owned_redis_value(Value::Array(vec![]));
         } else if self.transaction_mode {
             self.execute_transaction_async(con).await?
         } else {
             self.execute_pipelined_async(con).await?
         };
-        from_redis_value(&v)
+        from_owned_redis_value(v)
     }
 
     /// This is a shortcut to `query()` that does not return a value and
@@ -305,13 +303,13 @@ macro_rules! implement_pipeline_commands {
             }
 
             fn make_pipeline_results(&self, resp: Vec<Value>) -> Value {
-                let mut rv = vec![];
+                let mut rv = Vec::with_capacity(resp.len() - self.ignored_commands.len());
                 for (idx, result) in resp.into_iter().enumerate() {
                     if !self.ignored_commands.contains(&idx) {
                         rv.push(result);
                     }
                 }
-                Value::Bulk(rv)
+                Value::Array(rv)
             }
         }
 

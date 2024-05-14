@@ -74,14 +74,14 @@ fn test_cmd_options() {
 
     assert_args!(
         &opts,
+        "GROUP",
+        "group-name",
+        "consumer-name",
         "BLOCK",
         "100",
         "COUNT",
         "200",
-        "NOACK",
-        "GROUP",
-        "group-name",
-        "consumer-name"
+        "NOACK"
     );
 
     // should skip noack because of missing group(,)
@@ -136,9 +136,9 @@ fn test_assorted_1() {
     let _: RedisResult<String> = con.xadd_map("k3", "3000-0", map);
 
     let reply: StreamRangeReply = con.xrange_all("k3").unwrap();
-    assert!(reply.ids[0].contains_key(&"ab"));
-    assert!(reply.ids[0].contains_key(&"ef"));
-    assert!(reply.ids[0].contains_key(&"ij"));
+    assert!(reply.ids[0].contains_key("ab"));
+    assert!(reply.ids[0].contains_key("ef"));
+    assert!(reply.ids[0].contains_key("ij"));
 
     // test xadd w/ maxlength below...
 
@@ -192,6 +192,62 @@ fn test_xgroup_create() {
     let reply = result.unwrap();
     assert_eq!(&reply.groups.len(), &1);
     assert_eq!(&reply.groups[0].name, &"g1");
+}
+
+#[test]
+fn test_xgroup_createconsumer() {
+    // Tests the following command....
+    // xgroup_createconsumer
+
+    let ctx = TestContext::new();
+    let mut con = ctx.connection();
+
+    xadd(&mut con);
+
+    // key should exist
+    let reply: StreamInfoStreamReply = con.xinfo_stream("k1").unwrap();
+    assert_eq!(&reply.first_entry.id, "1000-0");
+    assert_eq!(&reply.last_entry.id, "1000-1");
+    assert_eq!(&reply.last_generated_id, "1000-1");
+
+    // xgroup create (existing stream)
+    let result: RedisResult<String> = con.xgroup_create("k1", "g1", "$");
+    assert!(result.is_ok());
+
+    // xinfo groups (existing stream)
+    let result: RedisResult<StreamInfoGroupsReply> = con.xinfo_groups("k1");
+    assert!(result.is_ok());
+    let reply = result.unwrap();
+    assert_eq!(&reply.groups.len(), &1);
+    assert_eq!(&reply.groups[0].name, &"g1");
+
+    // xinfo consumers (consumer does not exist)
+    let result: RedisResult<StreamInfoConsumersReply> = con.xinfo_consumers("k1", "g1");
+    assert!(result.is_ok());
+    let reply = result.unwrap();
+    assert_eq!(&reply.consumers.len(), &0);
+
+    // xgroup_createconsumer
+    let result: RedisResult<i32> = con.xgroup_createconsumer("k1", "g1", "c1");
+    assert!(matches!(result, Ok(1)));
+
+    // xinfo consumers (consumer was created)
+    let result: RedisResult<StreamInfoConsumersReply> = con.xinfo_consumers("k1", "g1");
+    assert!(result.is_ok());
+    let reply = result.unwrap();
+    assert_eq!(&reply.consumers.len(), &1);
+    assert_eq!(&reply.consumers[0].name, &"c1");
+
+    // second call will not create consumer
+    let result: RedisResult<i32> = con.xgroup_createconsumer("k1", "g1", "c1");
+    assert!(matches!(result, Ok(0)));
+
+    // xinfo consumers (consumer still exists)
+    let result: RedisResult<StreamInfoConsumersReply> = con.xinfo_consumers("k1", "g1");
+    assert!(result.is_ok());
+    let reply = result.unwrap();
+    assert_eq!(&reply.consumers.len(), &1);
+    assert_eq!(&reply.consumers[0].name, &"c1");
 }
 
 #[test]
@@ -387,6 +443,88 @@ fn test_xread_options_deleted_pel_entry() {
         result_deleted_entry.keys[0].ids[0].id
     );
 }
+
+#[test]
+fn test_xautoclaim() {
+    // Tests the following command....
+    // xautoclaim_options
+    let ctx = TestContext::new();
+    let mut con = ctx.connection();
+
+    // xautoclaim test basic idea:
+    // 1. we need to test adding messages to a group
+    // 2. then xreadgroup needs to define a consumer and read pending
+    //    messages without acking them
+    // 3. then we need to sleep 5ms and call xautoclaim to claim message
+    //    past the idle time and read them from a different consumer
+
+    // create the group
+    let result: RedisResult<String> = con.xgroup_create_mkstream("k1", "g1", "$");
+    assert!(result.is_ok());
+
+    // add some keys
+    xadd_keyrange(&mut con, "k1", 0, 10);
+
+    // read the pending items for this key & group
+    let reply: StreamReadReply = con
+        .xread_options(
+            &["k1"],
+            &[">"],
+            &StreamReadOptions::default().group("g1", "c1"),
+        )
+        .unwrap();
+    // verify we have 10 ids
+    assert_eq!(reply.keys[0].ids.len(), 10);
+
+    // save this StreamId for later
+    let claim = &reply.keys[0].ids[0];
+    let claim_1 = &reply.keys[0].ids[1];
+
+    // sleep for 5ms
+    sleep(Duration::from_millis(10));
+
+    // grab this id if > 4ms
+    let reply: StreamAutoClaimReply = con
+        .xautoclaim_options(
+            "k1",
+            "g1",
+            "c2",
+            4,
+            claim.id.clone(),
+            StreamAutoClaimOptions::default().count(2),
+        )
+        .unwrap();
+    assert_eq!(reply.claimed.len(), 2);
+    assert_eq!(reply.claimed[0].id, claim.id);
+    assert!(!reply.claimed[0].map.is_empty());
+    assert_eq!(reply.claimed[1].id, claim_1.id);
+    assert!(!reply.claimed[1].map.is_empty());
+
+    // sleep for 5ms
+    sleep(Duration::from_millis(5));
+
+    // let's test some of the xautoclaim_options
+    // call force on the same claim.id
+    let reply: StreamAutoClaimReply = con
+        .xautoclaim_options(
+            "k1",
+            "g1",
+            "c3",
+            4,
+            claim.id.clone(),
+            StreamAutoClaimOptions::default().count(5).with_justid(),
+        )
+        .unwrap();
+
+    // we just claimed the first original 5 ids
+    // and only returned the ids
+    assert_eq!(reply.claimed.len(), 5);
+    assert_eq!(reply.claimed[0].id, claim.id);
+    assert!(reply.claimed[0].map.is_empty());
+    assert_eq!(reply.claimed[1].id, claim_1.id);
+    assert!(reply.claimed[1].map.is_empty());
+}
+
 #[test]
 fn test_xclaim() {
     // Tests the following commands....

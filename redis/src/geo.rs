@@ -104,8 +104,10 @@ impl<T: ToRedisArgs> ToRedisArgs for Coord<T> {
 ///
 /// [1]: https://redis.io/commands/georadius
 /// [2]: https://redis.io/commands/georadiusbymember
+#[derive(Default)]
 pub enum RadiusOrder {
     /// Don't sort the results
+    #[default]
     Unsorted,
 
     /// Sort returned items from the nearest to the farthest, relative to the center.
@@ -113,12 +115,6 @@ pub enum RadiusOrder {
 
     /// Sort returned items from the farthest to the nearest, relative to the center.
     Desc,
-}
-
-impl Default for RadiusOrder {
-    fn default() -> RadiusOrder {
-        RadiusOrder::Unsorted
-    }
 }
 
 /// Options for the [GEORADIUS][1] and [GEORADIUSBYMEMBER][2] commands
@@ -267,7 +263,7 @@ impl FromRedisValue for RadiusSearchResult {
         }
 
         // Try to parse the result from multitple values
-        if let Value::Bulk(ref items) = *v {
+        if let Value::Array(ref items) = *v {
             if let Some(result) = RadiusSearchResult::parse_multi_values(items) {
                 return Ok(result);
             }

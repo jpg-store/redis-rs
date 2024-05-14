@@ -53,7 +53,7 @@
 //! if so desired.  Some of them are turned on by default.
 //!
 //! * `acl`: enables acl support (enabled by default)
-//! * `aio`: enables async IO support (enabled by default)
+//! * `aio`: enables async IO support (optional)
 //! * `geospatial`: enables geospatial support (enabled by default)
 //! * `script`: enables script support (enabled by default)
 //! * `r2d2`: enables r2d2 connection pool support (optional)
@@ -62,7 +62,7 @@
 //! * `cluster-async`: enables async redis cluster support (optional)
 //! * `tokio-comp`: enables support for tokio (optional)
 //! * `connection-manager`: enables support for automatic reconnection (optional)
-//! * `keep-alive`: enables keep-alive option on socket by means of `socket2` crate (optional)
+//! * `keep-alive`: enables keep-alive option on socket by means of `socket2` crate (enabled by default)
 //!
 //! ## Connection Parameters
 //!
@@ -299,8 +299,7 @@
 # Scripts
 
 Lua scripts are supported through the `Script` type in a convenient
-way (it does not support pipelining currently).  It will automatically
-load the script if it does not exist and invoke it.
+way.  It will automatically load the script if it does not exist and invoke it.
 
 Example:
 
@@ -311,10 +310,33 @@ Example:
 let script = redis::Script::new(r"
     return tonumber(ARGV[1]) + tonumber(ARGV[2]);
 ");
-let result : isize = script.arg(1).arg(2).invoke(&mut con)?;
+let result: isize = script.arg(1).arg(2).invoke(&mut con)?;
 assert_eq!(result, 3);
 # Ok(()) }
 ```
+
+Scripts can also be pipelined:
+
+```rust,no_run
+# fn do_something() -> redis::RedisResult<()> {
+# let client = redis::Client::open("redis://127.0.0.1/").unwrap();
+# let mut con = client.get_connection().unwrap();
+let script = redis::Script::new(r"
+    return tonumber(ARGV[1]) + tonumber(ARGV[2]);
+");
+let (a, b): (isize, isize) = redis::pipe()
+    .invoke_script(script.arg(1).arg(2))
+    .invoke_script(script.arg(2).arg(3))
+    .query(&mut con)?;
+
+assert_eq!(a, 3);
+assert_eq!(b, 5);
+# Ok(()) }
+```
+
+Note: unlike a call to [`invoke`](ScriptInvocation::invoke), if the script isn't loaded during the pipeline operation,
+it will not automatically be loaded and retried. The script can be loaded using the 
+[`load`](ScriptInvocation::load) operation.
 "##
 )]
 //!
@@ -369,10 +391,11 @@ pub use crate::commands::{
 };
 pub use crate::connection::{
     parse_redis_url, transaction, Connection, ConnectionAddr, ConnectionInfo, ConnectionLike,
-    IntoConnectionInfo, Msg, PubSub, RedisConnectionInfo,
+    IntoConnectionInfo, Msg, PubSub, RedisConnectionInfo, TlsMode,
 };
 pub use crate::parser::{parse_redis_value, Parser};
 pub use crate::pipeline::Pipeline;
+pub use push_manager::{PushInfo, PushManager};
 
 #[cfg(feature = "script")]
 #[cfg_attr(docsrs, doc(cfg(feature = "script")))]
@@ -383,6 +406,7 @@ pub use crate::script::{Script, ScriptInvocation};
 pub use crate::types::{
     // utility functions
     from_redis_value,
+    from_owned_redis_value,
 
     // error kinds
     ErrorKind,
@@ -405,6 +429,9 @@ pub use crate::types::{
 
     // low level values
     Value,
+    PushKind,
+    VerbatimFormat,
+    ProtocolVersion
 };
 
 #[cfg(feature = "aio")]
@@ -444,8 +471,9 @@ mod cluster_client;
 #[cfg(feature = "cluster")]
 mod cluster_pipeline;
 
+/// Routing information for cluster commands.
 #[cfg(feature = "cluster")]
-mod cluster_routing;
+pub mod cluster_routing;
 
 #[cfg(feature = "r2d2")]
 #[cfg_attr(docsrs, doc(cfg(feature = "r2d2")))]
@@ -458,10 +486,20 @@ pub mod streams;
 #[cfg(feature = "cluster-async")]
 pub mod cluster_async;
 
+#[cfg(feature = "sentinel")]
+pub mod sentinel;
+
+#[cfg(feature = "tls-rustls")]
+mod tls;
+
+#[cfg(feature = "tls-rustls")]
+pub use crate::tls::{ClientTlsConfig, TlsCertificates};
+
 mod client;
 mod cmd;
 mod commands;
 mod connection;
 mod parser;
+mod push_manager;
 mod script;
 mod types;

@@ -1,13 +1,20 @@
+use crate::connection::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
+use crate::types::{ErrorKind, ProtocolVersion, RedisError, RedisResult};
+use crate::{cluster, cluster::TlsMode};
+use rand::Rng;
 use std::time::Duration;
 
-use rand::Rng;
+#[cfg(feature = "tls-rustls")]
+use crate::tls::TlsConnParams;
 
-use crate::connection::{ConnectionAddr, ConnectionInfo, IntoConnectionInfo};
-use crate::types::{ErrorKind, RedisError, RedisResult};
-use crate::{cluster, cluster::TlsMode};
+#[cfg(not(feature = "tls-rustls"))]
+use crate::connection::TlsConnParams;
 
 #[cfg(feature = "cluster-async")]
 use crate::cluster_async;
+
+#[cfg(feature = "tls-rustls")]
+use crate::tls::{retrieve_tls_certificates, TlsCertificates};
 
 /// Parameters specific to builder, so that
 /// builder parameters may have different types
@@ -18,7 +25,12 @@ struct BuilderParams {
     username: Option<String>,
     read_from_replicas: bool,
     tls: Option<TlsMode>,
+    #[cfg(feature = "tls-rustls")]
+    certs: Option<TlsCertificates>,
     retries_configuration: RetryParams,
+    connection_timeout: Option<Duration>,
+    response_timeout: Option<Duration>,
+    protocol: ProtocolVersion,
 }
 
 #[derive(Clone)]
@@ -69,17 +81,35 @@ pub(crate) struct ClusterParams {
     /// When None, connections do not use tls.
     pub(crate) tls: Option<TlsMode>,
     pub(crate) retry_params: RetryParams,
+    pub(crate) tls_params: Option<TlsConnParams>,
+    pub(crate) connection_timeout: Duration,
+    pub(crate) response_timeout: Duration,
+    pub(crate) protocol: ProtocolVersion,
 }
 
-impl From<BuilderParams> for ClusterParams {
-    fn from(value: BuilderParams) -> Self {
-        Self {
+impl ClusterParams {
+    fn from(value: BuilderParams) -> RedisResult<Self> {
+        #[cfg(not(feature = "tls-rustls"))]
+        let tls_params = None;
+
+        #[cfg(feature = "tls-rustls")]
+        let tls_params = {
+            let retrieved_tls_params = value.certs.clone().map(retrieve_tls_certificates);
+
+            retrieved_tls_params.transpose()?
+        };
+
+        Ok(Self {
             password: value.password,
             username: value.username,
             read_from_replicas: value.read_from_replicas,
             tls: value.tls,
             retry_params: value.retries_configuration,
-        }
+            tls_params,
+            connection_timeout: value.connection_timeout.unwrap_or(Duration::from_secs(1)),
+            response_timeout: value.response_timeout.unwrap_or(Duration::MAX),
+            protocol: value.protocol,
+        })
     }
 }
 
@@ -93,7 +123,9 @@ impl ClusterClientBuilder {
     /// Creates a new `ClusterClientBuilder` with the provided initial_nodes.
     ///
     /// This is the same as `ClusterClient::builder(initial_nodes)`.
-    pub fn new<T: IntoConnectionInfo>(initial_nodes: Vec<T>) -> ClusterClientBuilder {
+    pub fn new<T: IntoConnectionInfo>(
+        initial_nodes: impl IntoIterator<Item = T>,
+    ) -> ClusterClientBuilder {
         ClusterClientBuilder {
             initial_nodes: initial_nodes
                 .into_iter()
@@ -107,6 +139,9 @@ impl ClusterClientBuilder {
     ///
     /// This does not create connections to the Redis Cluster, but only performs some basic checks
     /// on the initial nodes' URLs and passwords/usernames.
+    ///
+    /// When the `tls-rustls` feature is enabled and TLS credentials are provided, they are set for
+    /// each cluster connection.
     ///
     /// # Errors
     ///
@@ -125,15 +160,19 @@ impl ClusterClientBuilder {
             }
         };
 
-        let mut cluster_params: ClusterParams = self.builder_params.into();
+        let mut cluster_params = ClusterParams::from(self.builder_params)?;
         let password = if cluster_params.password.is_none() {
-            cluster_params.password = first_node.redis.password.clone();
+            cluster_params
+                .password
+                .clone_from(&first_node.redis.password);
             &cluster_params.password
         } else {
             &None
         };
         let username = if cluster_params.username.is_none() {
-            cluster_params.username = first_node.redis.username.clone();
+            cluster_params
+                .username
+                .clone_from(&first_node.redis.username);
             &cluster_params.username
         } else {
             &None
@@ -144,6 +183,7 @@ impl ClusterClientBuilder {
                     host: _,
                     port: _,
                     insecure,
+                    tls_params: _,
                 } => Some(match insecure {
                     false => TlsMode::Secure,
                     true => TlsMode::Insecure,
@@ -153,7 +193,7 @@ impl ClusterClientBuilder {
         }
 
         let mut nodes = Vec::with_capacity(initial_nodes.len());
-        for node in initial_nodes {
+        for mut node in initial_nodes {
             if let ConnectionAddr::Unix(_) = node.addr {
                 return Err(RedisError::from((ErrorKind::InvalidClientConfig,
                                              "This library cannot use unix socket because Redis's cluster command returns only cluster's IP and port.")));
@@ -172,7 +212,7 @@ impl ClusterClientBuilder {
                     "Cannot use different username among initial nodes.",
                 )));
             }
-
+            node.redis.protocol = cluster_params.protocol;
             nodes.push(node);
         }
 
@@ -229,12 +269,59 @@ impl ClusterClientBuilder {
         self
     }
 
+    /// Sets raw TLS certificates for the new ClusterClient.
+    ///
+    /// When set, enforces the connection must be TLS secured.
+    ///
+    /// All certificates must be provided as byte streams loaded from PEM files their consistency is
+    /// checked during `build()` call.
+    ///
+    /// - `certificates` - `TlsCertificates` structure containing:
+    /// -- `client_tls` - Optional `ClientTlsConfig` containing byte streams for
+    /// --- `client_cert` - client's byte stream containing client certificate in PEM format
+    /// --- `client_key` - client's byte stream containing private key in PEM format
+    /// -- `root_cert` - Optional byte stream yielding PEM formatted file for root certificates.
+    ///
+    /// If `ClientTlsConfig` ( cert+key pair ) is not provided, then client-side authentication is not enabled.
+    /// If `root_cert` is not provided, then system root certificates are used instead.
+    #[cfg(feature = "tls-rustls")]
+    pub fn certs(mut self, certificates: TlsCertificates) -> ClusterClientBuilder {
+        if self.builder_params.tls.is_none() {
+            self.builder_params.tls = Some(TlsMode::Secure);
+        }
+
+        self.builder_params.certs = Some(certificates);
+        self
+    }
+
     /// Enables reading from replicas for all new connections (default is disabled).
     ///
     /// If enabled, then read queries will go to the replica nodes & write queries will go to the
     /// primary nodes. If there are no replica nodes, then all queries will go to the primary nodes.
     pub fn read_from_replicas(mut self) -> ClusterClientBuilder {
         self.builder_params.read_from_replicas = true;
+        self
+    }
+
+    /// Enables timing out on slow connection time.
+    ///
+    /// If enabled, the cluster will only wait the given time on each connection attempt to each node.
+    pub fn connection_timeout(mut self, connection_timeout: Duration) -> ClusterClientBuilder {
+        self.builder_params.connection_timeout = Some(connection_timeout);
+        self
+    }
+
+    /// Enables timing out on slow responses.
+    ///
+    /// If enabled, the cluster will only wait the given time to each response from each node.
+    pub fn response_timeout(mut self, response_timeout: Duration) -> ClusterClientBuilder {
+        self.builder_params.response_timeout = Some(response_timeout);
+        self
+    }
+
+    /// Sets the protocol with which the client should communicate with the server.
+    pub fn use_protocol(mut self, protocol: ProtocolVersion) -> ClusterClientBuilder {
+        self.builder_params.protocol = protocol;
         self
     }
 
@@ -269,12 +356,16 @@ impl ClusterClient {
     ///
     /// Upon failure to parse initial nodes or if the initial nodes have different passwords or
     /// usernames, an error is returned.
-    pub fn new<T: IntoConnectionInfo>(initial_nodes: Vec<T>) -> RedisResult<ClusterClient> {
+    pub fn new<T: IntoConnectionInfo>(
+        initial_nodes: impl IntoIterator<Item = T>,
+    ) -> RedisResult<ClusterClient> {
         Self::builder(initial_nodes).build()
     }
 
     /// Creates a [`ClusterClientBuilder`] with the provided initial_nodes.
-    pub fn builder<T: IntoConnectionInfo>(initial_nodes: Vec<T>) -> ClusterClientBuilder {
+    pub fn builder<T: IntoConnectionInfo>(
+        initial_nodes: impl IntoIterator<Item = T>,
+    ) -> ClusterClientBuilder {
         ClusterClientBuilder::new(initial_nodes)
     }
 

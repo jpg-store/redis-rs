@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, Write};
 use std::net::{self, SocketAddr, TcpStream, ToSocketAddrs};
@@ -10,35 +11,50 @@ use crate::cmd::{cmd, pipe, Cmd};
 use crate::parser::Parser;
 use crate::pipeline::Pipeline;
 use crate::types::{
-    from_redis_value, ErrorKind, FromRedisValue, RedisError, RedisResult, ToRedisArgs, Value,
+    from_redis_value, ErrorKind, FromRedisValue, HashMap, PushKind, RedisError, RedisResult,
+    ToRedisArgs, Value,
 };
+use crate::{from_owned_redis_value, ProtocolVersion};
 
-#[cfg(unix)]
-use crate::types::HashMap;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
+use std::vec::IntoIter;
 
+use crate::commands::resp3_hello;
 #[cfg(all(feature = "tls-native-tls", not(feature = "tls-rustls")))]
 use native_tls::{TlsConnector, TlsStream};
 
 #[cfg(feature = "tls-rustls")]
 use rustls::{RootCertStore, StreamOwned};
 #[cfg(feature = "tls-rustls")]
-use std::{convert::TryInto, sync::Arc};
+use std::sync::Arc;
 
-#[cfg(feature = "tls-rustls-webpki-roots")]
-use rustls::OwnedTrustAnchor;
-#[cfg(feature = "tls-rustls-webpki-roots")]
-use webpki_roots::TLS_SERVER_ROOTS;
+use crate::push_manager::PushManager;
+use crate::PushInfo;
 
-#[cfg(all(feature = "tls-rustls", not(feature = "tls-rustls-webpki-roots")))]
+#[cfg(all(
+    feature = "tls-rustls",
+    not(feature = "tls-native-tls"),
+    not(feature = "tls-rustls-webpki-roots")
+))]
 use rustls_native_certs::load_native_certs;
+
+#[cfg(feature = "tls-rustls")]
+use crate::tls::TlsConnParams;
+
+// Non-exhaustive to prevent construction outside this crate
+#[cfg(not(feature = "tls-rustls"))]
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct TlsConnParams;
 
 static DEFAULT_PORT: u16 = 6379;
 
 #[inline(always)]
 fn connect_tcp(addr: (&str, u16)) -> io::Result<TcpStream> {
     let socket = TcpStream::connect(addr)?;
+    #[cfg(feature = "tcp_nodelay")]
+    socket.set_nodelay(true)?;
     #[cfg(feature = "keep-alive")]
     {
         //For now rely on system defaults
@@ -57,6 +73,8 @@ fn connect_tcp(addr: (&str, u16)) -> io::Result<TcpStream> {
 #[inline(always)]
 fn connect_tcp_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<TcpStream> {
     let socket = TcpStream::connect_timeout(addr, timeout)?;
+    #[cfg(feature = "tcp_nodelay")]
+    socket.set_nodelay(true)?;
     #[cfg(feature = "keep-alive")]
     {
         //For now rely on system defaults
@@ -85,12 +103,22 @@ pub fn parse_redis_url(input: &str) -> Option<url::Url> {
     }
 }
 
+/// TlsMode indicates use or do not use verification of certification.
+/// Check [ConnectionAddr](ConnectionAddr::TcpTls::insecure) for more.
+#[derive(Clone, Copy)]
+pub enum TlsMode {
+    /// Secure verify certification.
+    Secure,
+    /// Insecure do not verify certification.
+    Insecure,
+}
+
 /// Defines the connection address.
 ///
 /// Not all connection addresses are supported on all platforms.  For instance
 /// to connect to a unix socket you need to run this on an operating system
 /// that supports them.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum ConnectionAddr {
     /// Format for this is `(host, port)`.
     Tcp(String, u16),
@@ -109,10 +137,41 @@ pub enum ConnectionAddr {
         /// trusted for use from any other. This introduces a significant
         /// vulnerability to man-in-the-middle attacks.
         insecure: bool,
+
+        /// TLS certificates and client key.
+        tls_params: Option<TlsConnParams>,
     },
     /// Format for this is the path to the unix socket.
     Unix(PathBuf),
 }
+
+impl PartialEq for ConnectionAddr {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ConnectionAddr::Tcp(host1, port1), ConnectionAddr::Tcp(host2, port2)) => {
+                host1 == host2 && port1 == port2
+            }
+            (
+                ConnectionAddr::TcpTls {
+                    host: host1,
+                    port: port1,
+                    insecure: insecure1,
+                    tls_params: _,
+                },
+                ConnectionAddr::TcpTls {
+                    host: host2,
+                    port: port2,
+                    insecure: insecure2,
+                    tls_params: _,
+                },
+            ) => port1 == port2 && host1 == host2 && insecure1 == insecure2,
+            (ConnectionAddr::Unix(path1), ConnectionAddr::Unix(path2)) => path1 == path2,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ConnectionAddr {}
 
 impl ConnectionAddr {
     /// Checks if this address is supported.
@@ -163,6 +222,8 @@ pub struct RedisConnectionInfo {
     pub username: Option<String>,
     /// Optionally a password that should be used for connection.
     pub password: Option<String>,
+    /// Version of the protocol to use.
+    pub protocol: ProtocolVersion,
 }
 
 impl FromStr for ConnectionInfo {
@@ -187,6 +248,14 @@ impl IntoConnectionInfo for ConnectionInfo {
     }
 }
 
+/// URL format: `{redis|rediss}://[<username>][:<password>@]<hostname>[:port][/<db>]`
+///
+/// - Basic: `redis://127.0.0.1:6379`
+/// - Username & Password: `redis://user:password@127.0.0.1:6379`
+/// - Password only: `redis://:password@127.0.0.1:6379`
+/// - Specifying DB: `redis://127.0.0.1:6379/0`
+/// - Enabling TLS: `rediss://127.0.0.1:6379`
+/// - Enabling Insecure TLS: `rediss://127.0.0.1:6379/#insecure`
 impl<'a> IntoConnectionInfo for &'a str {
     fn into_connection_info(self) -> RedisResult<ConnectionInfo> {
         match parse_redis_url(self) {
@@ -208,6 +277,14 @@ where
     }
 }
 
+/// URL format: `{redis|rediss}://[<username>][:<password>@]<hostname>[:port][/<db>]`
+///
+/// - Basic: `redis://127.0.0.1:6379`
+/// - Username & Password: `redis://user:password@127.0.0.1:6379`
+/// - Password only: `redis://:password@127.0.0.1:6379`
+/// - Specifying DB: `redis://127.0.0.1:6379/0`
+/// - Enabling TLS: `rediss://127.0.0.1:6379`
+/// - Enabling Insecure TLS: `rediss://127.0.0.1:6379/#insecure`
 impl IntoConnectionInfo for String {
     fn into_connection_info(self) -> RedisResult<ConnectionInfo> {
         match parse_redis_url(&self) {
@@ -248,6 +325,7 @@ fn url_to_tcp_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
                     host,
                     port,
                     insecure: true,
+                    tls_params: None,
                 },
                 Some(_) => fail!((
                     ErrorKind::InvalidClientConfig,
@@ -257,6 +335,7 @@ fn url_to_tcp_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
                     host,
                     port,
                     insecure: false,
+                    tls_params: None,
                 },
             }
         }
@@ -269,15 +348,15 @@ fn url_to_tcp_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
     } else {
         ConnectionAddr::Tcp(host, port)
     };
+    let query: HashMap<_, _> = url.query_pairs().collect();
     Ok(ConnectionInfo {
         addr,
         redis: RedisConnectionInfo {
             db: match url.path().trim_matches('/') {
                 "" => 0,
-                path => unwrap_or!(
-                    path.parse::<i64>().ok(),
-                    fail!((ErrorKind::InvalidClientConfig, "Invalid database number"))
-                ),
+                path => path.parse::<i64>().map_err(|_| -> RedisError {
+                    (ErrorKind::InvalidClientConfig, "Invalid database number").into()
+                })?,
             },
             username: if url.username().is_empty() {
                 None
@@ -300,6 +379,16 @@ fn url_to_tcp_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
                 },
                 None => None,
             },
+            protocol: match query.get("resp3") {
+                Some(v) => {
+                    if v == "true" {
+                        ProtocolVersion::RESP3
+                    } else {
+                        ProtocolVersion::RESP2
+                    }
+                }
+                _ => ProtocolVersion::RESP2,
+            },
         },
     })
 }
@@ -308,20 +397,29 @@ fn url_to_tcp_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
 fn url_to_unix_connection_info(url: url::Url) -> RedisResult<ConnectionInfo> {
     let query: HashMap<_, _> = url.query_pairs().collect();
     Ok(ConnectionInfo {
-        addr: ConnectionAddr::Unix(unwrap_or!(
-            url.to_file_path().ok(),
-            fail!((ErrorKind::InvalidClientConfig, "Missing path"))
-        )),
+        addr: ConnectionAddr::Unix(url.to_file_path().map_err(|_| -> RedisError {
+            (ErrorKind::InvalidClientConfig, "Missing path").into()
+        })?),
         redis: RedisConnectionInfo {
             db: match query.get("db") {
-                Some(db) => unwrap_or!(
-                    db.parse::<i64>().ok(),
-                    fail!((ErrorKind::InvalidClientConfig, "Invalid database number"))
-                ),
+                Some(db) => db.parse::<i64>().map_err(|_| -> RedisError {
+                    (ErrorKind::InvalidClientConfig, "Invalid database number").into()
+                })?,
+
                 None => 0,
             },
             username: query.get("user").map(|username| username.to_string()),
             password: query.get("pass").map(|password| password.to_string()),
+            protocol: match query.get("resp3") {
+                Some(v) => {
+                    if v == "true" {
+                        ProtocolVersion::RESP3
+                    } else {
+                        ProtocolVersion::RESP2
+                    }
+                }
+                _ => ProtocolVersion::RESP2,
+            },
         },
     })
 }
@@ -381,20 +479,50 @@ enum ActualConnection {
 }
 
 #[cfg(feature = "tls-rustls-insecure")]
-struct NoCertificateVerification;
+struct NoCertificateVerification {
+    supported: rustls::crypto::WebPkiSupportedAlgorithms,
+}
 
 #[cfg(feature = "tls-rustls-insecure")]
-impl rustls::client::ServerCertVerifier for NoCertificateVerification {
+impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
     fn verify_server_cert(
         &self,
-        _end_entity: &rustls::Certificate,
-        _intermediates: &[rustls::Certificate],
-        _server_name: &rustls::ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<rustls::client::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::ServerCertVerified::assertion())
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.supported.supported_schemes()
+    }
+}
+
+#[cfg(feature = "tls-rustls-insecure")]
+impl fmt::Debug for NoCertificateVerification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NoCertificateVerification").finish()
     }
 }
 
@@ -409,15 +537,23 @@ pub struct Connection {
     /// This flag is checked when attempting to send a command, and if it's raised, we attempt to
     /// exit the pubsub state before executing the new request.
     pubsub: bool,
+
+    // Field indicating which protocol to use for server communications.
+    protocol: ProtocolVersion,
+
+    /// `PushManager` instance for the connection.
+    /// This is used to manage Push messages in RESP3 mode.
+    push_manager: PushManager,
 }
 
 /// Represents a pubsub connection.
 pub struct PubSub<'a> {
     con: &'a mut Connection,
+    waiting_messages: VecDeque<Msg>,
 }
 
 /// Represents a pubsub message.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Msg {
     payload: Value,
     channel: Value,
@@ -469,6 +605,7 @@ impl ActualConnection {
                 ref host,
                 port,
                 insecure,
+                ..
             } => {
                 let tls_connector = if insecure {
                     TlsConnector::builder()
@@ -528,10 +665,14 @@ impl ActualConnection {
                 ref host,
                 port,
                 insecure,
+                ref tls_params,
             } => {
                 let host: &str = host;
-                let config = create_rustls_config(insecure)?;
-                let conn = rustls::ClientConnection::new(Arc::new(config), host.try_into()?)?;
+                let config = create_rustls_config(insecure, tls_params.clone())?;
+                let conn = rustls::ClientConnection::new(
+                    Arc::new(config),
+                    rustls_pki_types::ServerName::try_from(host)?.to_owned(),
+                )?;
                 let reader = match timeout {
                     None => {
                         let tcp = connect_tcp((host, port))?;
@@ -597,7 +738,7 @@ impl ActualConnection {
                 let res = connection.reader.write_all(bytes).map_err(RedisError::from);
                 match res {
                     Err(e) => {
-                        if e.is_connection_dropped() {
+                        if e.is_unrecoverable_error() {
                             connection.open = false;
                         }
                         Err(e)
@@ -610,7 +751,7 @@ impl ActualConnection {
                 let res = connection.reader.write_all(bytes).map_err(RedisError::from);
                 match res {
                     Err(e) => {
-                        if e.is_connection_dropped() {
+                        if e.is_unrecoverable_error() {
                             connection.open = false;
                         }
                         Err(e)
@@ -623,7 +764,7 @@ impl ActualConnection {
                 let res = connection.reader.write_all(bytes).map_err(RedisError::from);
                 match res {
                     Err(e) => {
-                        if e.is_connection_dropped() {
+                        if e.is_unrecoverable_error() {
                             connection.open = false;
                         }
                         Err(e)
@@ -636,7 +777,7 @@ impl ActualConnection {
                 let result = connection.sock.write_all(bytes).map_err(RedisError::from);
                 match result {
                     Err(e) => {
-                        if e.is_connection_dropped() {
+                        if e.is_unrecoverable_error() {
                             connection.open = false;
                         }
                         Err(e)
@@ -707,27 +848,52 @@ impl ActualConnection {
 }
 
 #[cfg(feature = "tls-rustls")]
-pub(crate) fn create_rustls_config(insecure: bool) -> RedisResult<rustls::ClientConfig> {
+pub(crate) fn create_rustls_config(
+    insecure: bool,
+    tls_params: Option<TlsConnParams>,
+) -> RedisResult<rustls::ClientConfig> {
+    use crate::tls::ClientTlsParams;
+
+    #[allow(unused_mut)]
     let mut root_store = RootCertStore::empty();
     #[cfg(feature = "tls-rustls-webpki-roots")]
-    root_store.add_server_trust_anchors(TLS_SERVER_ROOTS.0.iter().map(|ta| {
-        OwnedTrustAnchor::from_subject_spki_name_constraints(
-            ta.subject,
-            ta.spki,
-            ta.name_constraints,
-        )
-    }));
-    #[cfg(all(feature = "tls-rustls", not(feature = "tls-rustls-webpki-roots")))]
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    #[cfg(all(
+        feature = "tls-rustls",
+        not(feature = "tls-native-tls"),
+        not(feature = "tls-rustls-webpki-roots")
+    ))]
     for cert in load_native_certs()? {
-        root_store.add(&rustls::Certificate(cert.0))?;
+        root_store.add(cert)?;
     }
 
-    let config = rustls::ClientConfig::builder()
-        .with_safe_default_cipher_suites()
-        .with_safe_default_kx_groups()
-        .with_protocol_versions(rustls::ALL_VERSIONS)?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    let config = rustls::ClientConfig::builder();
+    let config = if let Some(tls_params) = tls_params {
+        let config_builder =
+            config.with_root_certificates(tls_params.root_cert_store.unwrap_or(root_store));
+
+        if let Some(ClientTlsParams {
+            client_cert_chain: client_cert,
+            client_key,
+        }) = tls_params.client_tls_params
+        {
+            config_builder
+                .with_client_auth_cert(client_cert, client_key)
+                .map_err(|err| {
+                    RedisError::from((
+                        ErrorKind::InvalidClientConfig,
+                        "Unable to build client with TLS parameters provided.",
+                        err.to_string(),
+                    ))
+                })?
+        } else {
+            config_builder.with_no_client_auth()
+        }
+    } else {
+        config
+            .with_root_certificates(root_store)
+            .with_no_client_auth()
+    };
 
     match (insecure, cfg!(feature = "tls-rustls-insecure")) {
         #[cfg(feature = "tls-rustls-insecure")]
@@ -736,7 +902,10 @@ pub(crate) fn create_rustls_config(insecure: bool) -> RedisResult<rustls::Client
             config.enable_sni = false;
             config
                 .dangerous()
-                .set_certificate_verifier(Arc::new(NoCertificateVerification));
+                .set_certificate_verifier(Arc::new(NoCertificateVerification {
+                    supported: rustls::crypto::ring::default_provider()
+                        .signature_verification_algorithms,
+                }));
 
             Ok(config)
         }
@@ -796,6 +965,24 @@ pub fn connect(
     setup_connection(con, &connection_info.redis)
 }
 
+#[cfg(not(feature = "disable-client-setinfo"))]
+pub(crate) fn client_set_info_pipeline() -> Pipeline {
+    let mut pipeline = crate::pipe();
+    pipeline
+        .cmd("CLIENT")
+        .arg("SETINFO")
+        .arg("LIB-NAME")
+        .arg("redis-rs")
+        .ignore();
+    pipeline
+        .cmd("CLIENT")
+        .arg("SETINFO")
+        .arg("LIB-VER")
+        .arg(env!("CARGO_PKG_VERSION"))
+        .ignore();
+    pipeline
+}
+
 fn setup_connection(
     con: ActualConnection,
     connection_info: &RedisConnectionInfo,
@@ -805,12 +992,19 @@ fn setup_connection(
         parser: Parser::new(),
         db: connection_info.db,
         pubsub: false,
+        protocol: connection_info.protocol,
+        push_manager: PushManager::new(),
     };
 
-    if connection_info.password.is_some() {
+    if connection_info.protocol != ProtocolVersion::RESP2 {
+        let hello_cmd = resp3_hello(connection_info);
+        let val: RedisResult<Value> = hello_cmd.query(&mut rv);
+        if let Err(err) = val {
+            return Err(get_resp3_hello_command_error(err));
+        }
+    } else if connection_info.password.is_some() {
         connect_auth(&mut rv, connection_info)?;
     }
-
     if connection_info.db != 0 {
         match cmd("SELECT")
             .arg(connection_info.db)
@@ -823,6 +1017,11 @@ fn setup_connection(
             )),
         }
     }
+
+    // result is ignored, as per the command's instructions.
+    // https://redis.io/commands/client-setinfo/
+    #[cfg(not(feature = "disable-client-setinfo"))]
+    let _: RedisResult<()> = client_set_info_pipeline().query(&mut rv);
 
     Ok(rv)
 }
@@ -845,6 +1044,11 @@ pub trait ConnectionLike {
     /// Sends multiple already encoded (packed) command into the TCP socket
     /// and reads `count` responses from it.  This is used to implement
     /// pipelining.
+    /// Important - this function is meant for internal usage, since it's
+    /// easy to pass incorrect `offset` & `count` parameters, which might
+    /// cause the connection to enter an erroneous state. Users shouldn't
+    /// call it, instead using the Pipeline::query function.
+    #[doc(hidden)]
     fn req_packed_commands(
         &mut self,
         cmd: &[u8],
@@ -852,7 +1056,7 @@ pub trait ConnectionLike {
         count: usize,
     ) -> RedisResult<Vec<Value>>;
 
-    /// Sends a [Cmd](Cmd) into the TCP socket and reads a single response from it.
+    /// Sends a [Cmd] into the TCP socket and reads a single response from it.
     fn req_command(&mut self, cmd: &Cmd) -> RedisResult<Value> {
         let pcmd = cmd.get_packed_command();
         self.req_packed_command(&pcmd)
@@ -896,7 +1100,7 @@ impl Connection {
     /// `MONITOR` which yield multiple items.  This needs to be used with
     /// care because it changes the state of the connection.
     pub fn send_packed_command(&mut self, cmd: &[u8]) -> RedisResult<()> {
-        self.con.send_bytes(cmd)?;
+        self.send_bytes(cmd)?;
         Ok(())
     }
 
@@ -959,13 +1163,9 @@ impl Connection {
             let unsubscribe = cmd("UNSUBSCRIBE").get_packed_command();
             let punsubscribe = cmd("PUNSUBSCRIBE").get_packed_command();
 
-            // Grab a reference to the underlying connection so that we may send
-            // the commands without immediately blocking for a response.
-            let con = &mut self.con;
-
             // Execute commands
-            con.send_bytes(&unsubscribe)?;
-            con.send_bytes(&punsubscribe)?;
+            self.send_bytes(&unsubscribe)?;
+            self.send_bytes(&punsubscribe)?;
         }
 
         // Receive responses
@@ -975,17 +1175,32 @@ impl Connection {
         // messages are received until the _subscription count_ in the responses reach zero.
         let mut received_unsub = false;
         let mut received_punsub = false;
-        loop {
-            let res: (Vec<u8>, (), isize) = from_redis_value(&self.recv_response()?)?;
-
-            match res.0.first() {
-                Some(&b'u') => received_unsub = true,
-                Some(&b'p') => received_punsub = true,
-                _ => (),
+        if self.protocol != ProtocolVersion::RESP2 {
+            while let Value::Push { kind, data } = from_owned_redis_value(self.recv_response()?)? {
+                if data.len() >= 2 {
+                    if let Value::Int(num) = data[1] {
+                        if resp3_is_pub_sub_state_cleared(
+                            &mut received_unsub,
+                            &mut received_punsub,
+                            &kind,
+                            num as isize,
+                        ) {
+                            break;
+                        }
+                    }
+                }
             }
-
-            if received_unsub && received_punsub && res.2 == 0 {
-                break;
+        } else {
+            loop {
+                let res: (Vec<u8>, (), isize) = from_owned_redis_value(self.recv_response()?)?;
+                if resp2_is_pub_sub_state_cleared(
+                    &mut received_unsub,
+                    &mut received_punsub,
+                    &res.0,
+                    res.2,
+                ) {
+                    break;
+                }
             }
         }
 
@@ -998,21 +1213,29 @@ impl Connection {
     fn read_response(&mut self) -> RedisResult<Value> {
         let result = match self.con {
             ActualConnection::Tcp(TcpConnection { ref mut reader, .. }) => {
-                self.parser.parse_value(reader)
+                let result = self.parser.parse_value(reader);
+                self.push_manager.try_send(&result);
+                result
             }
             #[cfg(all(feature = "tls-native-tls", not(feature = "tls-rustls")))]
             ActualConnection::TcpNativeTls(ref mut boxed_tls_connection) => {
                 let reader = &mut boxed_tls_connection.reader;
-                self.parser.parse_value(reader)
+                let result = self.parser.parse_value(reader);
+                self.push_manager.try_send(&result);
+                result
             }
             #[cfg(feature = "tls-rustls")]
             ActualConnection::TcpRustls(ref mut boxed_tls_connection) => {
                 let reader = &mut boxed_tls_connection.reader;
-                self.parser.parse_value(reader)
+                let result = self.parser.parse_value(reader);
+                self.push_manager.try_send(&result);
+                result
             }
             #[cfg(unix)]
             ActualConnection::Unix(UnixConnection { ref mut sock, .. }) => {
-                self.parser.parse_value(sock)
+                let result = self.parser.parse_value(sock);
+                self.push_manager.try_send(&result);
+                result
             }
         };
         // shutdown connection on protocol error
@@ -1022,6 +1245,11 @@ impl Connection {
                 None => false,
             };
             if shutdown {
+                // Notify the PushManager that the connection was lost
+                self.push_manager.try_send_raw(&Value::Push {
+                    kind: PushKind::Disconnection,
+                    data: vec![],
+                });
                 match self.con {
                     ActualConnection::Tcp(ref mut connection) => {
                         let _ = connection.reader.shutdown(net::Shutdown::Both);
@@ -1047,16 +1275,66 @@ impl Connection {
         }
         result
     }
+
+    /// Returns `PushManager` of Connection, this method is used to subscribe/unsubscribe from Push types
+    pub fn get_push_manager(&self) -> PushManager {
+        self.push_manager.clone()
+    }
+
+    fn send_bytes(&mut self, bytes: &[u8]) -> RedisResult<Value> {
+        let result = self.con.send_bytes(bytes);
+        if self.protocol != ProtocolVersion::RESP2 {
+            if let Err(e) = &result {
+                if e.is_connection_dropped() {
+                    // Notify the PushManager that the connection was lost
+                    self.push_manager.try_send_raw(&Value::Push {
+                        kind: PushKind::Disconnection,
+                        data: vec![],
+                    });
+                }
+            }
+        }
+        result
+    }
 }
 
 impl ConnectionLike for Connection {
+    /// Sends a [Cmd] into the TCP socket and reads a single response from it.
+    fn req_command(&mut self, cmd: &Cmd) -> RedisResult<Value> {
+        let pcmd = cmd.get_packed_command();
+        if self.pubsub {
+            self.exit_pubsub()?;
+        }
+
+        self.send_bytes(&pcmd)?;
+        if cmd.is_no_response() {
+            return Ok(Value::Nil);
+        }
+        loop {
+            match self.read_response()? {
+                Value::Push {
+                    kind: _kind,
+                    data: _data,
+                } => continue,
+                val => return Ok(val),
+            }
+        }
+    }
     fn req_packed_command(&mut self, cmd: &[u8]) -> RedisResult<Value> {
         if self.pubsub {
             self.exit_pubsub()?;
         }
 
-        self.con.send_bytes(cmd)?;
-        self.read_response()
+        self.send_bytes(cmd)?;
+        loop {
+            match self.read_response()? {
+                Value::Push {
+                    kind: _kind,
+                    data: _data,
+                } => continue,
+                val => return Ok(val),
+            }
+        }
     }
 
     fn req_packed_commands(
@@ -1068,10 +1346,12 @@ impl ConnectionLike for Connection {
         if self.pubsub {
             self.exit_pubsub()?;
         }
-        self.con.send_bytes(cmd)?;
+        self.send_bytes(cmd)?;
         let mut rv = vec![];
         let mut first_err = None;
-        for idx in 0..(offset + count) {
+        let mut count = count;
+        let mut idx = 0;
+        while idx < (offset + count) {
             // When processing a transaction, some responses may be errors.
             // We need to keep processing the rest of the responses in that case,
             // so bailing early with `?` would not be correct.
@@ -1079,7 +1359,15 @@ impl ConnectionLike for Connection {
             let response = self.read_response();
             match response {
                 Ok(item) => {
-                    if idx >= offset {
+                    // RESP3 can insert push data between command replies
+                    if let Value::Push {
+                        kind: _kind,
+                        data: _data,
+                    } = item
+                    {
+                        // if that is the case we have to extend the loop and handle push data
+                        count += 1;
+                    } else if idx >= offset {
                         rv.push(item);
                     }
                 }
@@ -1089,6 +1377,7 @@ impl ConnectionLike for Connection {
                     }
                 }
             }
+            idx += 1;
         }
 
         first_err.map_or(Ok(rv), Err)
@@ -1098,12 +1387,12 @@ impl ConnectionLike for Connection {
         self.db
     }
 
-    fn is_open(&self) -> bool {
-        self.con.is_open()
-    }
-
     fn check_connection(&mut self) -> bool {
         cmd("PING").query::<String>(self).is_ok()
+    }
+
+    fn is_open(&self) -> bool {
+        self.con.is_open()
     }
 }
 
@@ -1169,27 +1458,45 @@ where
 /// ```
 impl<'a> PubSub<'a> {
     fn new(con: &'a mut Connection) -> Self {
-        Self { con }
+        Self {
+            con,
+            waiting_messages: VecDeque::new(),
+        }
+    }
+
+    fn cache_messages_until_received_response(&mut self, cmd: &mut Cmd) -> RedisResult<()> {
+        if self.con.protocol != ProtocolVersion::RESP2 {
+            cmd.set_no_response(true);
+        }
+        let mut response = cmd.query(self.con)?;
+        loop {
+            if let Some(msg) = Msg::from_value(&response) {
+                self.waiting_messages.push_back(msg);
+            } else {
+                return Ok(());
+            }
+            response = self.con.recv_response()?;
+        }
     }
 
     /// Subscribes to a new channel.
     pub fn subscribe<T: ToRedisArgs>(&mut self, channel: T) -> RedisResult<()> {
-        cmd("SUBSCRIBE").arg(channel).query(self.con)
+        self.cache_messages_until_received_response(cmd("SUBSCRIBE").arg(channel))
     }
 
     /// Subscribes to a new channel with a pattern.
     pub fn psubscribe<T: ToRedisArgs>(&mut self, pchannel: T) -> RedisResult<()> {
-        cmd("PSUBSCRIBE").arg(pchannel).query(self.con)
+        self.cache_messages_until_received_response(cmd("PSUBSCRIBE").arg(pchannel))
     }
 
     /// Unsubscribes from a channel.
     pub fn unsubscribe<T: ToRedisArgs>(&mut self, channel: T) -> RedisResult<()> {
-        cmd("UNSUBSCRIBE").arg(channel).query(self.con)
+        self.cache_messages_until_received_response(cmd("UNSUBSCRIBE").arg(channel))
     }
 
     /// Unsubscribes from a channel with a pattern.
     pub fn punsubscribe<T: ToRedisArgs>(&mut self, pchannel: T) -> RedisResult<()> {
-        cmd("PUNSUBSCRIBE").arg(pchannel).query(self.con)
+        self.cache_messages_until_received_response(cmd("PUNSUBSCRIBE").arg(pchannel))
     }
 
     /// Fetches the next message from the pubsub connection.  Blocks until
@@ -1199,6 +1506,9 @@ impl<'a> PubSub<'a> {
     /// The message itself is still generic and can be converted into an
     /// appropriate type through the helper methods on it.
     pub fn get_message(&mut self) -> RedisResult<Msg> {
+        if let Some(msg) = self.waiting_messages.pop_front() {
+            return Ok(msg);
+        }
         loop {
             if let Some(msg) = Msg::from_value(&self.con.recv_response()?) {
                 return Ok(msg);
@@ -1228,18 +1538,57 @@ impl<'a> Drop for PubSub<'a> {
 /// connection.  It only contains actual message data.
 impl Msg {
     /// Tries to convert provided [`Value`] into [`Msg`].
+    #[allow(clippy::unnecessary_to_owned)]
     pub fn from_value(value: &Value) -> Option<Self> {
-        let raw_msg: Vec<Value> = from_redis_value(value).ok()?;
-        let mut iter = raw_msg.into_iter();
-        let msg_type: String = from_redis_value(&iter.next()?).ok()?;
         let mut pattern = None;
         let payload;
         let channel;
 
-        if msg_type == "message" {
+        if let Value::Push { kind, data } = value {
+            let mut iter: IntoIter<Value> = data.to_vec().into_iter();
+            if kind == &PushKind::Message || kind == &PushKind::SMessage {
+                channel = iter.next()?;
+                payload = iter.next()?;
+            } else if kind == &PushKind::PMessage {
+                pattern = Some(iter.next()?);
+                channel = iter.next()?;
+                payload = iter.next()?;
+            } else {
+                return None;
+            }
+        } else {
+            let raw_msg: Vec<Value> = from_redis_value(value).ok()?;
+            let mut iter = raw_msg.into_iter();
+            let msg_type: String = from_owned_redis_value(iter.next()?).ok()?;
+            if msg_type == "message" {
+                channel = iter.next()?;
+                payload = iter.next()?;
+            } else if msg_type == "pmessage" {
+                pattern = Some(iter.next()?);
+                channel = iter.next()?;
+                payload = iter.next()?;
+            } else {
+                return None;
+            }
+        };
+        Some(Msg {
+            payload,
+            channel,
+            pattern,
+        })
+    }
+
+    /// Tries to convert provided [`PushInfo`] into [`Msg`].
+    pub fn from_push_info(push_info: &PushInfo) -> Option<Self> {
+        let mut pattern = None;
+        let payload;
+        let channel;
+
+        let mut iter = push_info.data.iter().cloned();
+        if push_info.kind == PushKind::Message || push_info.kind == PushKind::SMessage {
             channel = iter.next()?;
             payload = iter.next()?;
-        } else if msg_type == "pmessage" {
+        } else if push_info.kind == PushKind::PMessage {
             pattern = Some(iter.next()?);
             channel = iter.next()?;
             payload = iter.next()?;
@@ -1265,7 +1614,7 @@ impl Msg {
     /// not happen) then the return value is `"?"`.
     pub fn get_channel_name(&self) -> &str {
         match self.channel {
-            Value::Data(ref bytes) => from_utf8(bytes).unwrap_or("?"),
+            Value::BulkString(ref bytes) => from_utf8(bytes).unwrap_or("?"),
             _ => "?",
         }
     }
@@ -1280,7 +1629,7 @@ impl Msg {
     /// in the raw bytes in it.
     pub fn get_payload_bytes(&self) -> &[u8] {
         match self.payload {
-            Value::Data(ref bytes) => bytes,
+            Value::BulkString(ref bytes) => bytes,
             _ => b"",
         }
     }
@@ -1364,6 +1713,51 @@ pub fn transaction<
         }
     }
 }
+//TODO: for both clearing logic support sharded channels.
+
+/// Common logic for clearing subscriptions in RESP2 async/sync
+pub fn resp2_is_pub_sub_state_cleared(
+    received_unsub: &mut bool,
+    received_punsub: &mut bool,
+    kind: &[u8],
+    num: isize,
+) -> bool {
+    match kind.first() {
+        Some(&b'u') => *received_unsub = true,
+        Some(&b'p') => *received_punsub = true,
+        _ => (),
+    };
+    *received_unsub && *received_punsub && num == 0
+}
+
+/// Common logic for clearing subscriptions in RESP3 async/sync
+pub fn resp3_is_pub_sub_state_cleared(
+    received_unsub: &mut bool,
+    received_punsub: &mut bool,
+    kind: &PushKind,
+    num: isize,
+) -> bool {
+    match kind {
+        PushKind::Unsubscribe => *received_unsub = true,
+        PushKind::PUnsubscribe => *received_punsub = true,
+        _ => (),
+    };
+    *received_unsub && *received_punsub && num == 0
+}
+
+/// Common logic for checking real cause of hello3 command error
+pub fn get_resp3_hello_command_error(err: RedisError) -> RedisError {
+    if let Some(detail) = err.detail() {
+        if detail.starts_with("unknown command `HELLO`") {
+            return (
+                ErrorKind::RESP3NotSupported,
+                "Redis Server doesn't support HELLO command therefore resp3 cannot be used",
+            )
+                .into();
+        }
+    }
+    err
+}
 
 #[cfg(test)]
 mod tests {
@@ -1414,6 +1808,7 @@ mod tests {
                         db: 2,
                         username: Some("%johndoe%".to_string()),
                         password: Some("#@<>$".to_string()),
+                        ..Default::default()
                     },
                 },
             ),
@@ -1480,6 +1875,7 @@ mod tests {
                         db: 0,
                         username: None,
                         password: None,
+                        protocol: ProtocolVersion::RESP2,
                     },
                 },
             ),
@@ -1489,8 +1885,7 @@ mod tests {
                     addr: ConnectionAddr::Unix("/var/run/redis.sock".into()),
                     redis: RedisConnectionInfo {
                         db: 1,
-                        username: None,
-                        password: None,
+                        ..Default::default()
                     },
                 },
             ),
@@ -1505,6 +1900,7 @@ mod tests {
                         db: 2,
                         username: Some("%johndoe%".to_string()),
                         password: Some("#@<>$".to_string()),
+                        ..Default::default()
                     },
                 },
             ),
@@ -1519,6 +1915,7 @@ mod tests {
                         db: 2,
                         username: Some("%johndoe%".to_string()),
                         password: Some("&?= *+".to_string()),
+                        ..Default::default()
                     },
                 },
             ),

@@ -58,7 +58,7 @@ macro_rules! implement_commands {
             #[inline]
             fn scan_options<RV: FromRedisValue>(&mut self, opts: ScanOptions) -> RedisResult<Iter<'_, RV>> {
                 let mut c = cmd("SCAN");
-                c.cursor_arg(0).arg(opts);
+                c.cursor_arg("0".to_string()).arg(opts);
                 c.iter(self)
             }
 
@@ -190,7 +190,7 @@ macro_rules! implement_commands {
             #[inline]
             fn scan_options<RV: FromRedisValue>(&mut self, opts: ScanOptions) -> crate::types::RedisFuture<crate::cmd::AsyncIter<'_, RV>> {
                 let mut c = cmd("SCAN");
-                c.cursor_arg(0).arg(opts);
+                c.cursor_arg("0".to_string()).arg(opts);
                 Box::pin(async move { c.iter_async(self).await })
             }
 
